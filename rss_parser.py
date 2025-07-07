@@ -11,7 +11,8 @@ from io import BytesIO
 from datetime import datetime
 from dateutil import parser as date_parser
 from bs4 import BeautifulSoup, Tag
-from bs4._typing import _AttributeValue
+from bs4.element import AttributeValue
+
 
 logger = logging.getLogger('AsyncRSSParser')
 
