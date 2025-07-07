@@ -213,19 +213,19 @@ class AsyncRSSParser:
                 continue
 
             prop = meta.get('property', '')
-            if isinstance(prop, (str, _AttributeValue)):
+            if isinstance(prop, (str, AttributeValue)):
                 prop = str(prop).lower()
             else:
                 prop = ''
                 
             name = meta.get('name', '')
-            if isinstance(name, (str, _AttributeValue)):
+            if isinstance(name, (str, AttributeValue)):
                 name = str(name).lower()
             else:
                 name = ''
                 
             content = meta.get('content', '')
-            if isinstance(content, (str, _AttributeValue)):
+            if isinstance(content, (str, AttributeValue)):
                 content = str(content)
             else:
                 content = ''
@@ -243,7 +243,7 @@ class AsyncRSSParser:
                     continue
 
                 img_src = img.get('src') or img.get('srcset', '')
-                if isinstance(img_src, (str, _AttributeValue)):
+                if isinstance(img_src, (str, AttributeValue)):
                     img_src = str(img_src).split()[0] if img_src else ''
                 else:
                     img_src = ''
@@ -257,21 +257,21 @@ class AsyncRSSParser:
         # Логотип сайта
         if logo := soup.find('link', rel=['icon', 'shortcut icon']):
             if isinstance(logo, Tag) and (href := logo.get('href')):
-                if isinstance(href, (str, _AttributeValue)):
+                if isinstance(href, (str, AttributeValue)):
                     href = str(href)
                     return self._normalize_image_url(href, base_url)
 
         # Первое подходящее изображение
         for img in soup.find_all('img'):
             if isinstance(img, Tag) and (src := img.get('src')):
-                if isinstance(src, (str, _AttributeValue)):
+                if isinstance(src, (str, AttributeValue)):
                     src = str(src)
                     if self._is_valid_image(img, src):
                         return self._normalize_image_url(src, base_url)
         return None
 
     @staticmethod
-    def _normalize_image_url(url: Union[str, _AttributeValue, None], base_url: str) -> str:
+    def _normalize_image_url(url: Union[str, AttributeValue, None], base_url: str) -> str:
         """Нормализует URL изображения"""
         if not url:
             return ""
