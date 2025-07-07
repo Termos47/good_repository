@@ -1,0 +1,7 @@
+.env
+/__pycache__
+/logs
+/fonts
+/state_backups
+/temp_images
+/templates
