@@ -1,28 +1,31 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей
-RUN apt-get update && apt-get install -y \
-    libfreetype6-dev \
-    libjpeg-dev \
-    libopenjp2-7-dev \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
+# 1. Установка apt-utils перед основными пакетами
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends apt-utils && \
+    apt-get install -y --no-install-recommends \
+        libfreetype6-dev \
+        libjpeg-dev \
+        libopenjp2-7-dev \
+        zlib1g-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# 2. Настройка временной переменной для debconf
+ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# Создание виртуального окружения
+# 3. Создание виртуального окружения
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Обновление pip и установка зависимостей
+# 4. Обновление pip и установка зависимостей
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Копирование кода
 COPY . .
 
-# Создание рабочих директорий
 RUN mkdir -p logs temp_images templates fonts
 
 CMD ["python", "main.py"]
