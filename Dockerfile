@@ -1,8 +1,6 @@
-FROM python:3.11-alpine
+FROM python:3.11-slim
 
-WORKDIR /app
-
-# Установка системных зависимостей для Pillow
+# Установка системных зависимостей
 RUN apt-get update && apt-get install -y \
     libfreetype6-dev \
     libjpeg-dev \
@@ -10,14 +8,21 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Копирование зависимостей и установка
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+WORKDIR /app
 
-# Копирование исходного кода
+# Создание виртуального окружения
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Обновление pip и установка зависимостей
+COPY requirements.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Копирование кода
 COPY . .
 
-# Создание необходимых директорий
+# Создание рабочих директорий
 RUN mkdir -p logs temp_images templates fonts
 
 CMD ["python", "main.py"]
