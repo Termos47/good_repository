@@ -11,8 +11,6 @@ from io import BytesIO
 from datetime import datetime
 from dateutil import parser as date_parser
 from bs4 import BeautifulSoup, Tag
-from bs4.element import AttributeValue
-
 
 logger = logging.getLogger('AsyncRSSParser')
 
@@ -211,27 +209,13 @@ class AsyncRSSParser:
         for meta in soup.find_all('meta'):
             if not isinstance(meta, Tag):
                 continue
-
-            prop = meta.get('property', '')
-            if isinstance(prop, (str, AttributeValue)):
-                prop = str(prop).lower()
-            else:
-                prop = ''
                 
-            name = meta.get('name', '')
-            if isinstance(name, (str, AttributeValue)):
-                name = str(name).lower()
-            else:
-                name = ''
-                
-            content = meta.get('content', '')
-            if isinstance(content, (str, AttributeValue)):
-                content = str(content)
-            else:
-                content = ''
+            prop = str(meta.get('property', '')).lower()
+            name = str(meta.get('name', '')).lower()
+            content = str(meta.get('content', ''))
 
             if any(p in prop for p in ['og:image', 'image']) or \
-               any(n in name for n in ['twitter:image']):
+            any(n in name for n in ['twitter:image']):
                 return content if content else None
         return None
 
@@ -243,10 +227,7 @@ class AsyncRSSParser:
                     continue
 
                 img_src = img.get('src') or img.get('srcset', '')
-                if isinstance(img_src, (str, AttributeValue)):
-                    img_src = str(img_src).split()[0] if img_src else ''
-                else:
-                    img_src = ''
+                img_src = str(img_src).split()[0] if img_src else ''
 
                 if img_src and self._is_valid_image(img, img_src):
                     return self._normalize_image_url(img_src, base_url)
@@ -257,45 +238,47 @@ class AsyncRSSParser:
         # Логотип сайта
         if logo := soup.find('link', rel=['icon', 'shortcut icon']):
             if isinstance(logo, Tag) and (href := logo.get('href')):
-                if isinstance(href, (str, AttributeValue)):
-                    href = str(href)
-                    return self._normalize_image_url(href, base_url)
+                href = str(href)
+                return self._normalize_image_url(href, base_url)
 
         # Первое подходящее изображение
         for img in soup.find_all('img'):
             if isinstance(img, Tag) and (src := img.get('src')):
-                if isinstance(src, (str, AttributeValue)):
-                    src = str(src)
-                    if self._is_valid_image(img, src):
-                        return self._normalize_image_url(src, base_url)
+                src = str(src)
+                if self._is_valid_image(img, src):
+                    return self._normalize_image_url(src, base_url)
         return None
 
     @staticmethod
-    def _normalize_image_url(url: Union[str, AttributeValue, None], base_url: str) -> str:
+    def _normalize_image_url(url: Optional[str], base_url: str) -> str:
         """Нормализует URL изображения"""
         if not url:
             return ""
-            
-        url_str = str(url)
         
-        if url_str.startswith(('http://', 'https://')):
-            return url_str
-        if url_str.startswith('//'):
-            return f'https:{url_str}'
-        return urljoin(base_url, url_str)
+        # Убрали str(url) - теперь url всегда строка
+        if url.startswith(('http://', 'https://')):
+            return url
+        if url.startswith('//'):
+            return f'https:{url}'
+        return urljoin(base_url, url)
 
     @staticmethod
     def _is_valid_image(img_tag: Tag, img_url: str) -> bool:
         """Проверяет валидность изображения"""
-        if not img_url or any(x in str(img_url).lower() for x in ['pixel', 'icon', 'logo', 'spacer', 'ad']):
+        if not img_url or any(x in img_url.lower() for x in ['pixel', 'icon', 'logo', 'spacer', 'ad']):
             return False
 
-        # Проверка размеров через атрибуты
-        width = img_tag.get('width', '0')
-        height = img_tag.get('height', '0')
+        # Преобразуем атрибуты в строки перед обработкой
+        width_str = str(img_tag.get('width', '0'))
+        height_str = str(img_tag.get('height', '0'))
+        
+        # Удаляем нечисловые символы (например, 'px')
+        width_str = re.sub(r'[^\d]', '', width_str)
+        height_str = re.sub(r'[^\d]', '', height_str)
+        
         try:
-            width_int = int(str(width)) if width else 0
-            height_int = int(str(height)) if height else 0
+            width_int = int(width_str) if width_str else 0
+            height_int = int(height_str) if height_str else 0
             return width_int >= 300 and height_int >= 200
         except ValueError:
             return True

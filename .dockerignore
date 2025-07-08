@@ -1,0 +1,15 @@
+.gitignore
+.git
+__pycache__
+venv
+*.log
+*.bak
+*.tmp
+temp_images/*
+!templates
+!fonts
+Dockerfile
+docker-compose.yml
+.env
+*.pyc
+/data

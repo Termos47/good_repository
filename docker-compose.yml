@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  bot:
+    build: .
+    image: telegram-rss-bot
+    container_name: rss-bot
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./temp_images:/app/temp_images
+      - ./templates:/app/templates
+      - ./fonts:/app/fonts
+    env_file:
+      - .env
