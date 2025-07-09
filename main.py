@@ -144,10 +144,6 @@ async def run_bot():
         if config.OWNER_ID and not await test_bot_commands(telegram_bot, config.OWNER_ID):
             logger.error("Bot can't send messages, check TOKEN and OWNER_ID")
         
-        # Проверка возможности отправки сообщений
-        if config.OWNER_ID and not await test_bot_commands(telegram_bot, config.OWNER_ID):
-            logger.error("Bot can't send messages, check TOKEN and OWNER_ID")
-        
         # Инициализация компонентов
         rss_parser = AsyncRSSParser(session, config.PROXY_URL)
         yandex_gpt = AsyncYandexGPT(config, session)
