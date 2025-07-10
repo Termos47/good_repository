@@ -6,6 +6,7 @@ import signal
 import aiohttp
 import traceback
 import platform
+from config import app_config as config
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update, Message
@@ -17,6 +18,7 @@ from rss_parser import AsyncRSSParser
 from image_generator import AsyncImageGenerator
 from yandex_gpt import AsyncYandexGPT
 from telegram_interface import AsyncTelegramBot
+from visual_interface import UIBuilder
 from typing import Optional, Dict, Any
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
@@ -27,7 +29,7 @@ async def shutdown(loop, controller):
     logger.info("Shutting down...")
     try:
         if controller:
-            controller.state.save_state(controller.stats)
+            controller.state.save_state()
             await controller.stop()
     except Exception as e:
         logger.error(f"Error during shutdown: {str(e)}")

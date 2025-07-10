@@ -26,6 +26,7 @@ class BotController:
         self.yandex_gpt = yandex_gpt
         self.telegram_bot = telegram_bot
         self._validate_config()
+        self.hourly_stats = {f"hour_{h}": 0 for h in range(24)}
         
         # Инициализация логгера
         self.logger = logging.getLogger('bot.controller')
@@ -103,7 +104,7 @@ class BotController:
             'MAX_IMAGE_HEIGHT'
         ]
         for param in required:
-            if not hasattr(self, param) or not getattr(self, param):
+            if not hasattr(self.config, param) or not getattr(self.config, param):
                 raise ValueError(f"Missing required config: {param}")
             
     async def start(self) -> bool:
@@ -192,7 +193,6 @@ class BotController:
                 # Периодическое сохранение состояния
                 if time.time() - last_save_time > 300:
                     self.state.save_state()
-                    self.state.update_stats(self.stats)  # Сохраняем статистику
                     last_save_time = time.time()
                 
                 await asyncio.sleep(self.config.CHECK_INTERVAL)
@@ -396,7 +396,7 @@ class BotController:
             }
 
     async def _get_post_image(self, post: Dict) -> Optional[str]:
-    # Режим none - без изображений
+        # Режим none - без изображений
         if self.config.IMAGE_SOURCE == 'none':
             return None
 
@@ -406,15 +406,15 @@ class BotController:
                 
             # 1. Пробуем взять из RSS
             if post.get('image_url'):
-                    image_url = post['image_url']
+                image_url = post['image_url']
                 
-                # 2. Если нет - парсим страницу
+            # 2. Если нет - парсим страницу
             if not image_url and post.get('link'):
-                    image_url = await self.rss_parser.extract_primary_image(post['link'])
+                image_url = await self.rss_parser.extract_primary_image(post['link'])
                 
-                # 3. Скачиваем найденное изображение
+            # 3. Скачиваем найденное изображение
             if image_url:
-                    return await self._download_image(image_url, post['post_id'])
+                return await self._download_image(image_url, post['post_id'])
                 
             return None  # Не используем fallback!
         
@@ -626,6 +626,10 @@ class BotController:
         self.stats['last_post'] = datetime.now()
         self.last_post_time = time.time()
         
+        # Обновление почасовой статистики
+        hour = datetime.now().hour
+        self.hourly_stats[f"hour_{hour}"] = self.hourly_stats.get(f"hour_{hour}", 0) + 1
+        
         # Принудительное сохранение после первого поста
         try:
             self.state.save_state()
@@ -679,3 +683,14 @@ class BotController:
             f"<b>Сгенерировано изображений:</b> {self.stats.get('images_generated', 0)}\n"
             f"<b>Лент в обработке:</b> {len(self.config.RSS_URLS)}"
         )
+    
+    def get_rss_status(self) -> List[Dict]:
+        """Возвращает статус RSS-лент для визуализации"""
+        return [
+            {
+                'url': url,
+                'active': True,
+                'error_count': 0,
+                'last_check': datetime.now().isoformat()
+            } for url in self.config.RSS_URLS
+        ]

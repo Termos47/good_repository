@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import logging.config
@@ -481,14 +482,22 @@ class Config:
         except Exception:
             return (255, 255, 255)
 
-    def validate_rss_urls(self, urls: List[str]) -> List[str]:
-        """Валидирует список URL RSS-лент"""
+    def validate_rss_urls(self, urls: Union[str, List[str]]) -> List[str]:
+        if isinstance(urls, str):
+            # Обработка строки с JSON-форматом
+            if urls.startswith('[') and urls.endswith(']'):
+                try:
+                    urls = json.loads(urls)
+                except json.JSONDecodeError:
+                    urls = [url.strip() for url in urls[1:-1].split(',')]
+            else:
+                urls = [url.strip() for url in urls.split(',')]
+        
         valid_urls = []
         for url in urls:
+            url = url.strip(' "\'')  # Очистка кавычек
             if validators.url(url):
                 valid_urls.append(url)
-            else:
-                self.logger.error(f"Invalid RSS URL: {url}")
         return valid_urls
 
     def get_sanitized_proxy(self) -> Optional[str]:

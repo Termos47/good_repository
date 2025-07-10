@@ -2,14 +2,18 @@ from collections import deque
 import os
 import logging
 from state_manager import StateManager
-from typing import Optional, List, Dict, Any, Type
+from typing import Optional, List, Dict, Any
+from datetime import datetime
+
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands
+from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands, CallbackQuery, InputMediaPhoto
 from aiogram.enums import MenuButtonType
 from aiogram.filters import Command
 from config import Config
 from bot_controller import BotController
-import inspect
+from visual_interface import UIBuilder
+from aiogram.types import BufferedInputFile
+from aiogram.types import Message as TelegramMessage
 
 logger = logging.getLogger('AsyncTelegramBot')
 
@@ -21,6 +25,7 @@ class AsyncTelegramBot:
         self.bot = Bot(token=token)
         self.dp = Dispatcher()
         self.controller: Optional[BotController] = None
+        self.ui = UIBuilder(config)
         
         self._register_handlers()
     
@@ -28,6 +33,7 @@ class AsyncTelegramBot:
         """Устанавливает меню команд в строке ввода"""
         commands = [
             BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="menu", description="Открыть панель управления"),
             BotCommand(command="help", description="Помощь"),
             BotCommand(command="status", description="Статус бота"),
             BotCommand(command="stats", description="Статистика"),
@@ -45,7 +51,7 @@ class AsyncTelegramBot:
         ]
         await self.bot.set_my_commands(commands)
         await self.bot.set_chat_menu_button(menu_button=MenuButtonCommands(type=MenuButtonType.COMMANDS))
-        
+    
     async def send_post(
         self,
         title: str,
@@ -53,18 +59,13 @@ class AsyncTelegramBot:
         link: str,
         image_path: Optional[str] = None
     ) -> bool:
-        """Отправляет пост в Telegram канал с подробным логированием"""
+        """Отправляет пост в Telegram канал"""
         try:
-            # Сокращаем заголовок для логов
-            log_title = title[:50] + "..." if len(title) > 50 else title
-            
-            # Форматируем текст поста
             post_text = f"<b>{title}</b>\n\n{description}\n\n<a href='{link}'>Читать далее</a>"
             
-            # Отправляем сообщение
             if image_path:
                 if not os.path.exists(image_path):
-                    logger.error(f"Image not found: {image_path}")
+                    logger.error(f"Изображение не найдено: {image_path}")
                     return False
                     
                 photo = FSInputFile(image_path)
@@ -74,31 +75,22 @@ class AsyncTelegramBot:
                     caption=post_text,
                     parse_mode="HTML"
                 )
-                logger.info(f"Photo post sent: {log_title}")
+                logger.info(f"Отправлен пост с изображением: {title[:50]}...")
             else:
                 await self.bot.send_message(
                     chat_id=self.channel_id,
                     text=post_text,
                     parse_mode="HTML"
                 )
-                logger.info(f"Text post sent: {log_title}")
+                logger.info(f"Отправлен текстовый пост: {title[:50]}...")
                 
             return True
         except Exception as e:
-            logger.error(f"Failed to send post '{title[:30]}...': {str(e)}")
-            
-            # Логируем дополнительные детали для распространенных ошибок
-            if "Chat not found" in str(e):
-                logger.critical("CHANNEL_ID is invalid. Check channel permissions.")
-            elif "Forbidden" in str(e):
-                logger.critical("Bot has no access to the channel. Add bot as admin.")
-            elif "Too Many Requests" in str(e):
-                logger.warning("Telegram API rate limit exceeded. Reducing posting frequency.")
-                
+            logger.error(f"Ошибка отправки поста '{title[:30]}...': {str(e)}")
             return False
     
     def _register_handlers(self) -> None:
-        self.dp.message.register(self.handle_start, Command("start", "help"))
+        self.dp.message.register(self.handle_start, Command("start", "help", "menu"))
         self.dp.message.register(self.handle_status, Command("status"))
         self.dp.message.register(self.handle_stats, Command("stats"))
         self.dp.message.register(self.handle_rss_list, Command("rss_list"))
@@ -112,38 +104,272 @@ class AsyncTelegramBot:
         self.dp.message.register(self.handle_params_list, Command("params_list"))
         self.dp.message.register(self.handle_param_info, Command("param_info"))
         self.dp.message.register(self.handle_set_all, Command("set_all"))
+        
+        self.dp.callback_query.register(self.handle_callback)
+    
+    async def handle_callback(self, callback: CallbackQuery) -> None:
+        """Основной обработчик callback'ов"""
+        try:
+            if not callback.message or not isinstance(callback.message, TelegramMessage):
+                await callback.answer("Ошибка сообщения")
+                return
 
-    async def is_owner(self, message: Message) -> bool:
-        return message.from_user is not None and message.from_user.id == self.config.OWNER_ID
+            user_id = callback.from_user.id
+            chat_id = callback.message.chat.id
+            data = callback.data
+
+            logger.debug(f"Callback от пользователя {user_id}: {data}")
+
+            if data == "main_menu":
+                await self.send_main_menu(user_id, chat_id)
+            elif data == "stats":
+                await self.show_statistics(callback)
+            elif data == "monitoring":
+                await self.show_monitoring(callback)
+            elif data == "settings":
+                await self.show_settings_menu(callback)
+            elif data == "settings_general":
+                await self.show_general_settings(callback)
+            elif data == "settings_images":
+                await self.show_image_settings(callback)
+            elif data == "settings_ai":
+                await self.show_ai_settings(callback)
+            elif data == "settings_rss":
+                await self.show_rss_settings(callback)
+            elif data == "settings_notify":
+                await self.show_notify_settings(callback)
+            elif data == "change_theme":
+                await self.show_theme_selector(callback)
+            elif data.startswith("set_theme_"):
+                await self.set_theme(callback)
+            elif data == "rss_list":
+                await self.handle_rss_list(callback.message)
+            elif data == "start_bot":
+                await self.handle_start_bot(callback)
+            elif data == "stop_bot":
+                await self.handle_stop_bot(callback)
+            elif data == "back_to_settings":
+                await self.show_settings_menu(callback)
+            else:
+                logger.warning(f"Неизвестный callback: {data}")
+                await callback.answer("Функция в разработке")
+
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Ошибка обработки callback: {str(e)}", exc_info=True)
+            await callback.answer("Ошибка обработки запроса")
+
+    async def show_monitoring(self, callback: CallbackQuery) -> None:
+        """Показывает панель мониторинга"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        stats = self.controller.get_status_text()
+        await self.bot.send_message(
+            chat_id=callback.message.chat.id,
+            text=stats,
+            parse_mode="HTML"
+        )
+
+    async def set_theme(self, callback: CallbackQuery) -> None:
+        """Устанавливает тему оформления"""
+        theme_name = callback.data.replace("set_theme_", "")
+        if theme_name in self.ui.THEMES:
+            self.ui.user_themes[callback.from_user.id] = self.ui.THEMES[theme_name]
+            await callback.answer(f"Тема изменена на {theme_name}")
+            await self.show_settings_menu(callback)
+        else:
+            await callback.answer("Неизвестная тема")
+
+    async def show_general_settings(self, callback: CallbackQuery) -> None:
+        """Показывает общие настройки"""
+        text = (
+            "⚙️ <b>Общие настройки</b>\n\n"
+            f"• Интервал проверки: {self.config.CHECK_INTERVAL} сек\n"
+            f"• Макс. постов за цикл: {self.config.MAX_POSTS_PER_CYCLE}\n"
+            f"• Постов в час: {self.config.POSTS_PER_HOUR}\n"
+            f"• Мин. задержка между постами: {self.config.MIN_DELAY_BETWEEN_POSTS} сек"
+        )
+        
+        keyboard = await self.ui.back_to_settings()
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    async def show_ai_settings(self, callback: CallbackQuery) -> None:
+        """Показывает настройки AI"""
+        text = (
+            "🧠 <b>Настройки YandexGPT</b>\n\n"
+            f"• Модель: {self.config.YAGPT_MODEL}\n"
+            f"• Температура: {self.config.YAGPT_TEMPERATURE}\n"
+            f"• Макс. токенов: {self.config.YAGPT_MAX_TOKENS}\n"
+            f"• Статус: {'Активен' if not self.config.DISABLE_YAGPT else 'Отключен'}"
+        )
+        
+        keyboard = await self.ui.back_to_settings()
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    async def show_rss_settings(self, callback: CallbackQuery) -> None:
+        """Показывает настройки RSS"""
+        text = "📡 <b>Настройки RSS</b>\n\n"
+        text += f"• Количество лент: {len(self.config.RSS_URLS)}\n"
+        text += f"• Задержка между запросами: {self.config.RSS_REQUEST_DELAY} сек\n"
+        text += "• Текущие ленты:\n"
+        
+        for i, url in enumerate(self.config.RSS_URLS[:3], 1):
+            text += f"  {i}. {url[:50]}...\n"
+        if len(self.config.RSS_URLS) > 3:
+            text += f"  ...и еще {len(self.config.RSS_URLS)-3}\n"
+            
+        keyboard = await self.ui.back_to_settings()
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+
+    async def show_notify_settings(self, callback: CallbackQuery) -> None:
+        """Показывает настройки уведомлений"""
+        text = (
+            "🔔 <b>Настройки уведомлений</b>\n\n"
+            "Здесь будут настройки уведомлений\n"
+            "Функция в разработке"
+        )
+        
+        keyboard = await self.ui.back_to_settings()
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
 
     async def handle_start(self, message: Message) -> None:
-        help_text = (
-            "🤖 <b>RSS Bot with AI Enhancement</b>\n\n"
-            "📋 <b>Доступные команды:</b>\n"
-            "/status - Статус бота\n"
-            "/stats - Статистика\n"
-            "/rss_list - Список RSS\n"
-            "/rss_add [url] - Добавить RSS\n"
-            "/rss_remove [N] - Удалить RSS\n"
-            "/pause - Приостановить\n"
-            "/resume - Продолжить\n"
-            "/settings - Настройки\n"
-            "/set [param] [value] - Изменить параметр\n"
-            "/params_list - Все параметры\n"
-            "/param_info [param] - Инфо о параметре\n"
-            "/set_all [param] [value] - Изменить любой параметр\n\n"
-            "Примеры:\n"
-            "<code>/rss_add https://example.com/rss</code>\n"
-            "<code>/set POSTS_PER_HOUR 10</code>\n"
-            "<code>/set_all TEXT_COLOR 255,200,100</code>"
+        """Обработка команды /start"""
+        await self.send_main_menu(message.from_user.id, message.chat.id)
+    
+    async def send_main_menu(self, user_id: int, chat_id: int) -> None:
+        """Отправляет главное меню"""
+        keyboard = await self.ui.main_menu(user_id)
+        await self.bot.send_message(
+            chat_id=chat_id,
+            text="🤖 <b>Управление RSS Ботом</b>\n\nВыберите действие:",
+            reply_markup=keyboard,
+            parse_mode="HTML"
         )
-        await message.answer(help_text, parse_mode="HTML")
+    
+    async def show_statistics(self, callback: CallbackQuery) -> None:
+        """Отображает статистику"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        stats = self.controller.stats
+        text, media = await self.ui.stats_visualization(stats)
+        
+        if media:
+            await self.bot.send_photo(
+                chat_id=callback.message.chat.id,
+                photo=media.media,
+                caption=text,
+                parse_mode="HTML"
+            )
+        else:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=text,
+                parse_mode="HTML"
+            )
+    
+    async def show_settings_menu(self, callback: CallbackQuery) -> None:
+        """Показывает меню настроек"""
+        keyboard = await self.ui.settings_menu(callback.from_user.id)
+        
+        try:
+            await callback.message.edit_text(
+                "⚙️ <b>Настройки бота</b>\n\nВыберите категорию:",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text="⚙️ <b>Настройки бота</b>\n\nВыберите категорию:",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+    
+    async def show_image_settings(self, callback: CallbackQuery) -> None:
+        """Показывает настройки изображений"""
+        text, media = await self.ui.image_settings_view(callback.from_user.id)
+        
+        if media:
+            await self.bot.send_photo(
+                chat_id=callback.message.chat.id,
+                photo=media.media,
+                caption=text,
+                parse_mode="HTML"
+            )
+        else:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=text,
+                parse_mode="HTML"
+            )
+    
+    async def show_theme_selector(self, callback: CallbackQuery) -> None:
+        """Показывает выбор тем оформления"""
+        keyboard = await self.ui.theme_selector(callback.from_user.id)
+        
+        try:
+            await callback.message.edit_text(
+                "🎨 <b>Выбор темы оформления</b>\n\nВыберите стиль интерфейса:",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text="🎨 <b>Выбор темы оформления</b>\n\nВыберите стиль интерфейса:",
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+    
+    async def handle_start_bot(self, callback: CallbackQuery) -> None:
+        """Обработка запуска бота"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        await self.ui.animated_processing(callback.message, "Запуск бота")
+        
+        if not self.controller.is_running:
+            await self.controller.start()
+            await callback.answer("✅ Бот успешно запущен")
+    
+    async def handle_stop_bot(self, callback: CallbackQuery) -> None:
+        """Обработка остановки бота"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        await self.ui.animated_processing(callback.message, "Остановка бота")
+        
+        if self.controller.is_running:
+            await self.controller.stop()
+            await callback.answer("⏸ Бот остановлен")
 
     async def handle_status(self, message: Message) -> None:
         if not await self.is_owner(message):
             return
             
-        if self.controller is None:
+        if not self.controller:
             await message.answer("⚠️ Контроллер не подключен")
             return
             
@@ -154,7 +380,7 @@ class AsyncTelegramBot:
         if not await self.is_owner(message):
             return
             
-        if self.controller is None or not hasattr(self.controller, 'stats'):
+        if not self.controller or not hasattr(self.controller, 'stats'):
             await message.answer("⚠️ Статистика недоступна")
             return
             
@@ -170,6 +396,7 @@ class AsyncTelegramBot:
         await message.answer(stats, parse_mode="HTML")
 
     async def handle_rss_list(self, message: Message) -> None:
+        """Отправляет список RSS-лент"""
         if not await self.is_owner(message):
             return
             
@@ -183,12 +410,11 @@ class AsyncTelegramBot:
         
         await message.answer("\n".join(lines), parse_mode="HTML")
 
+    async def is_owner(self, message: Message) -> bool:
+        return message.from_user and message.from_user.id == self.config.OWNER_ID
+
     async def handle_rss_add(self, message: Message) -> None:
         if not await self.is_owner(message):
-            return
-            
-        if message.text is None:
-            await message.answer("❌ Неверный формат команды")
             return
             
         args = message.text.split()
@@ -206,10 +432,6 @@ class AsyncTelegramBot:
 
     async def handle_rss_remove(self, message: Message) -> None:
         if not await self.is_owner(message):
-            return
-            
-        if message.text is None:
-            await message.answer("❌ Неверный формат команды")
             return
             
         args = message.text.split()
@@ -231,7 +453,7 @@ class AsyncTelegramBot:
         if not await self.is_owner(message):
             return
             
-        if self.controller is None:
+        if not self.controller:
             await message.answer("⚠️ Контроллер не подключен")
             return
             
@@ -245,7 +467,7 @@ class AsyncTelegramBot:
         if not await self.is_owner(message):
             return
             
-        if self.controller is None:
+        if not self.controller:
             await message.answer("⚠️ Контроллер не подключен")
             return
             
@@ -280,10 +502,6 @@ class AsyncTelegramBot:
         if not await self.is_owner(message):
             return
             
-        if message.text is None:
-            await message.answer("❌ Неверный формат команды")
-            return
-            
         args = message.text.split()
         if len(args) < 3:
             await message.answer("❌ Используйте: /set [параметр] [значение]")
@@ -293,41 +511,13 @@ class AsyncTelegramBot:
         value = " ".join(args[2:])
         
         ALLOWED_PARAMS = {
-            'POSTS_PER_HOUR': {
-                'type': int,
-                'validator': lambda x: 1 <= x <= 60,
-                'error_msg': 'Должно быть целое число от 1 до 60'
-            },
-            'MIN_DELAY_BETWEEN_POSTS': {
-                'type': int,
-                'validator': lambda x: x >= 10,
-                'error_msg': 'Минимальная задержка 10 секунд'
-            },
-            'CHECK_INTERVAL': {
-                'type': int,
-                'validator': lambda x: x >= 60,
-                'error_msg': 'Интервал проверки не менее 60 секунд'
-            },
-            'ENABLE_IMAGE_GENERATION': {
-                'type': bool,
-                'validator': None,
-                'error_msg': ''
-            },
-            'DISABLE_YAGPT': {
-                'type': bool,
-                'validator': None,
-                'error_msg': ''
-            },
-            'YAGPT_MODEL': {
-                'type': str,
-                'validator': lambda x: x in ['yandexgpt-lite', 'yandexgpt-pro'],
-                'error_msg': 'Допустимые модели: yandexgpt-lite, yandexgpt-pro'
-            },
-            'YAGPT_TEMPERATURE': {
-                'type': float,
-                'validator': lambda x: 0.1 <= x <= 1.0,
-                'error_msg': 'Температура должна быть от 0.1 до 1.0'
-            }
+            'POSTS_PER_HOUR': {'type': int, 'validator': lambda x: 1 <= x <= 60, 'error_msg': 'Должно быть целое число от 1 до 60'},
+            'MIN_DELAY_BETWEEN_POSTS': {'type': int, 'validator': lambda x: x >= 10, 'error_msg': 'Минимальная задержка 10 секунд'},
+            'CHECK_INTERVAL': {'type': int, 'validator': lambda x: x >= 60, 'error_msg': 'Интервал проверки не менее 60 секунд'},
+            'ENABLE_IMAGE_GENERATION': {'type': bool, 'validator': None},
+            'DISABLE_YAGPT': {'type': bool, 'validator': None},
+            'YAGPT_MODEL': {'type': str, 'validator': lambda x: x in ['yandexgpt-lite', 'yandexgpt-pro'], 'error_msg': 'Допустимые модели: yandexgpt-lite, yandexgpt-pro'},
+            'YAGPT_TEMPERATURE': {'type': float, 'validator': lambda x: 0.1 <= x <= 1.0, 'error_msg': 'Температура должна быть от 0.1 до 1.0'}
         }
         
         if param not in ALLOWED_PARAMS:
@@ -348,8 +538,6 @@ class AsyncTelegramBot:
             
             setattr(self.config, param, converted_value)
             await message.answer(f"✅ Параметр {param} обновлен на {value}")
-            
-            # Сохраняем изменения в .env файл
             self.config.save_to_env_file(param, str(converted_value))
         except (TypeError, ValueError) as e:
             await message.answer(f"❌ Ошибка: {str(e)}")
@@ -358,12 +546,11 @@ class AsyncTelegramBot:
         if not await self.is_owner(message):
             return
             
-        if self.controller is None:
+        if not self.controller:
             await message.answer("⚠️ Контроллер не подключен")
             return
             
         try:
-            # Сбрасываем историю отправленных постов
             self.controller.state.state['sent_entries'] = {}
             await message.answer("✅ История отправленных постов очищена! Бот будет повторно отправлять новости.")
         except Exception as e:
@@ -371,18 +558,15 @@ class AsyncTelegramBot:
             await message.answer(f"❌ Ошибка при очистке истории: {str(e)}")
 
     async def handle_params_list(self, message: Message) -> None:
-        """Отображает список всех доступных параметров"""
         if not await self.is_owner(message):
             return
             
-        # Получаем все параметры конфига
         params = []
         for name in dir(self.config):
             if name.isupper() and not name.startswith('_') and not callable(getattr(self.config, name)):
                 value = getattr(self.config, name)
                 value_type = type(value).__name__
                 
-                # Сокращаем длинные значения
                 if isinstance(value, (list, tuple)) and len(value) > 3:
                     display_value = f"{value[:3]}... ({len(value)} items)"
                 elif isinstance(value, str) and len(value) > 50:
@@ -390,9 +574,8 @@ class AsyncTelegramBot:
                 else:
                     display_value = str(value)
                     
-                params.append(f"• <b>{name}</b> ({value_type}): {display_value}")
+                params.append(f"• <b>{name}</b>: {display_value}")
         
-        # Разбиваем на части из-за ограничения длины сообщения
         chunk_size = 15
         for i in range(0, len(params), chunk_size):
             chunk = params[i:i + chunk_size]
@@ -402,12 +585,7 @@ class AsyncTelegramBot:
             await message.answer(response, parse_mode="HTML")
 
     async def handle_param_info(self, message: Message) -> None:
-        """Показывает детальную информацию о параметре"""
         if not await self.is_owner(message):
-            return
-            
-        if message.text is None:
-            await message.answer("❌ Неверный формат команды")
             return
             
         args = message.text.split()
@@ -424,7 +602,6 @@ class AsyncTelegramBot:
         value = getattr(self.config, param_name)
         value_type = type(value).__name__
         
-        # Получаем описание типа
         type_description = {
             'int': 'целое число',
             'float': 'число с плавающей точкой',
@@ -434,7 +611,6 @@ class AsyncTelegramBot:
             'tuple': 'кортеж чисел (через запятую)'
         }.get(value_type, value_type)
         
-        # Форматируем примеры значений
         examples = {
             int: "42",
             float: "3.14",
@@ -458,12 +634,7 @@ class AsyncTelegramBot:
         await message.answer(response, parse_mode="HTML")
 
     async def handle_set_all(self, message: Message) -> None:
-        """Изменяет любой параметр конфигурации"""
         if not await self.is_owner(message):
-            return
-            
-        if message.text is None:
-            await message.answer("❌ Неверный формат команды")
             return
             
         args = message.text.split()
@@ -482,7 +653,6 @@ class AsyncTelegramBot:
         value_type = type(current_value)
         
         try:
-            # Преобразование типа
             if value_type is bool:
                 converted_value = new_value_str.lower() in ['true', '1', 'yes', 'y', 't', 'on']
             elif value_type is int:
@@ -496,16 +666,11 @@ class AsyncTelegramBot:
             elif value_type is str:
                 converted_value = new_value_str
             else:
-                # Попытка преобразования для неизвестных типов
                 converted_value = value_type(new_value_str)
             
-            # Установка нового значения
             setattr(self.config, param_name, converted_value)
-            
-            # Сохранение в .env файл
             self.config.save_to_env_file(param_name, str(converted_value))
             
-            # Форматирование ответа
             response = (
                 f"✅ <b>Параметр успешно обновлен!</b>\n\n"
                 f"<b>Параметр:</b> {param_name}\n"
@@ -513,7 +678,6 @@ class AsyncTelegramBot:
                 f"<b>Новое значение:</b> {converted_value}\n\n"
             )
             
-            # Предупреждение для критичных параметров
             critical_params = ['TOKEN', 'CHANNEL_ID', 'OWNER_ID', 'YANDEX_API_KEY']
             if param_name in critical_params:
                 response += "⚠️ <i>Для применения изменений может потребоваться перезагрузка бота</i>"
