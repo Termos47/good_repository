@@ -25,6 +25,7 @@ class BotController:
         self.image_generator = image_generator
         self.yandex_gpt = yandex_gpt
         self.telegram_bot = telegram_bot
+        self._validate_config()
         
         # Инициализация логгера
         self.logger = logging.getLogger('bot.controller')
@@ -93,6 +94,18 @@ class BotController:
             except Exception as backup_error:
                 self.logger.critical(f"Critical state error: {str(backup_error)}")
     
+    def _validate_config(self):
+        required = [
+            'TOKEN', 
+            'CHANNEL_ID',
+            'RSS_URLS',
+            'MAX_IMAGE_WIDTH',
+            'MAX_IMAGE_HEIGHT'
+        ]
+        for param in required:
+            if not hasattr(self, param) or not getattr(self, param):
+                raise ValueError(f"Missing required config: {param}")
+            
     async def start(self) -> bool:
         """Запуск основных процессов бота"""
         if self.is_running:
@@ -143,7 +156,8 @@ class BotController:
             await self._safe_shutdown()
             
             # ИСПРАВЛЕНИЕ: Сохраняем ВСЁ состояние перед выходом
-            self.state.save_state()
+            if self.state_manager:
+                self.state_manager.save_state()
             
             logger.info("Controller stopped successfully")
             return True

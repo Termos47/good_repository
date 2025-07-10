@@ -524,9 +524,8 @@ class Config:
         name: str, 
         default: Any = None, 
         required: bool = False, 
-        var_type: type = str
+        var_type: Optional[type] = None
     ) -> Any:
-        """Получает переменную окружения с преобразованием типа"""
         value = os.getenv(name, default)
         
         if required and value is None:
@@ -539,35 +538,60 @@ class Config:
         if value is None or value == "":
             return default
             
+        # Автоматическое определение типа, если не указан
+        if var_type is None:
+            if hasattr(cls, name) and name in cls.__annotations__:
+                var_type = cls.__annotations__[name]
+            else:
+                if isinstance(value, str):  # Добавлена проверка типа value
+                    if value.lower() in ['true', 'false']:
+                        var_type = bool
+                    elif value.replace('.', '', 1).isdigit():
+                        var_type = float if '.' in value else int
+                    elif ',' in value:
+                        var_type = list
+                    else:
+                        var_type = str
+                else:
+                    var_type = type(value)  # Используем тип значения по умолчанию
+        
+        # Проверка на None перед преобразованием
+        if var_type is None:
+            logger.warning(f"Cannot determine type for {name}, returning as-is")
+            return value
+        
         try:
-            if var_type is int:
+            if var_type is bool:
+                if isinstance(value, str):
+                    return value.lower() in ['true', '1', 'yes', 'y', 't', 'on']
+                return bool(value)
+            elif var_type is int:
                 return int(value)
             elif var_type is float:
                 return float(value)
             elif var_type is list:
                 if isinstance(value, str):
-                    value = value.strip('[]')
-                    return [url.strip().strip('"\'') for url in value.split(',') if url.strip()]
+                    return [item.strip() for item in value.split(',')]
                 return value
-            elif var_type is bool:
+            elif var_type is tuple:
                 if isinstance(value, str):
-                    return value.lower() in ['true', '1', 'yes', 'y', 't', 'on']
-                return bool(value)
-            return value
+                    return tuple(map(int, value.split(',')))
+                return value
+            else:
+                return var_type(value) if var_type is not str else value
         except (TypeError, ValueError) as e:
-            logger.error(f"Error converting {name} to {var_type}: {str(e)}")
+            type_name = var_type.__name__ if var_type is not None else 'None'
+            logger.error(f"Error converting {name} to {type_name}: {str(e)}")
             return default
-
 # Глобальный экземпляр конфигурации
-app_config: Optional[Config] = None
+app_config: Config = Config()  # Инициализация сразу
 
 def get_config() -> Config:
     """Возвращает глобальный экземпляр конфигурации"""
-    global app_config
-    if app_config is None:
-        app_config = Config()
     return app_config
 
-# Инициализация при импорте
-if __name__ != "__main__":
-    get_config()
+_init_done = False
+if not _init_done:
+    _init_done = True
+    # Просто обращаемся к конфигу для инициализации
+    _ = app_config

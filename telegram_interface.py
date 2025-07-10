@@ -2,13 +2,14 @@ from collections import deque
 import os
 import logging
 from state_manager import StateManager
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Type
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands
 from aiogram.enums import MenuButtonType
 from aiogram.filters import Command
 from config import Config
 from bot_controller import BotController
+import inspect
 
 logger = logging.getLogger('AsyncTelegramBot')
 
@@ -38,6 +39,9 @@ class AsyncTelegramBot:
             BotCommand(command="settings", description="Текущие настройки"),
             BotCommand(command="set", description="Изменить параметр"),
             BotCommand(command="clear_history", description="Очистить историю постов"),
+            BotCommand(command="params_list", description="Список всех параметров"),
+            BotCommand(command="param_info", description="Информация о параметре"),
+            BotCommand(command="set_all", description="Изменить любой параметр"),
         ]
         await self.bot.set_my_commands(commands)
         await self.bot.set_chat_menu_button(menu_button=MenuButtonCommands(type=MenuButtonType.COMMANDS))
@@ -105,6 +109,9 @@ class AsyncTelegramBot:
         self.dp.message.register(self.handle_settings, Command("settings"))
         self.dp.message.register(self.handle_set, Command("set"))
         self.dp.message.register(self.handle_clear_history, Command("clear_history"))
+        self.dp.message.register(self.handle_params_list, Command("params_list"))
+        self.dp.message.register(self.handle_param_info, Command("param_info"))
+        self.dp.message.register(self.handle_set_all, Command("set_all"))
 
     async def is_owner(self, message: Message) -> bool:
         return message.from_user is not None and message.from_user.id == self.config.OWNER_ID
@@ -121,10 +128,14 @@ class AsyncTelegramBot:
             "/pause - Приостановить\n"
             "/resume - Продолжить\n"
             "/settings - Настройки\n"
-            "/set [param] [value] - Изменить параметр\n\n"
+            "/set [param] [value] - Изменить параметр\n"
+            "/params_list - Все параметры\n"
+            "/param_info [param] - Инфо о параметре\n"
+            "/set_all [param] [value] - Изменить любой параметр\n\n"
             "Примеры:\n"
             "<code>/rss_add https://example.com/rss</code>\n"
-            "<code>/set POSTS_PER_HOUR 10</code>"
+            "<code>/set POSTS_PER_HOUR 10</code>\n"
+            "<code>/set_all TEXT_COLOR 255,200,100</code>"
         )
         await message.answer(help_text, parse_mode="HTML")
 
@@ -343,7 +354,6 @@ class AsyncTelegramBot:
         except (TypeError, ValueError) as e:
             await message.answer(f"❌ Ошибка: {str(e)}")
 
-# Исправляем работу с историей сообщений
     async def handle_clear_history(self, message: Message) -> None:
         if not await self.is_owner(message):
             return
@@ -359,6 +369,164 @@ class AsyncTelegramBot:
         except Exception as e:
             logger.error(f"Error clearing history: {str(e)}")
             await message.answer(f"❌ Ошибка при очистке истории: {str(e)}")
+
+    async def handle_params_list(self, message: Message) -> None:
+        """Отображает список всех доступных параметров"""
+        if not await self.is_owner(message):
+            return
+            
+        # Получаем все параметры конфига
+        params = []
+        for name in dir(self.config):
+            if name.isupper() and not name.startswith('_') and not callable(getattr(self.config, name)):
+                value = getattr(self.config, name)
+                value_type = type(value).__name__
+                
+                # Сокращаем длинные значения
+                if isinstance(value, (list, tuple)) and len(value) > 3:
+                    display_value = f"{value[:3]}... ({len(value)} items)"
+                elif isinstance(value, str) and len(value) > 50:
+                    display_value = value[:50] + "..."
+                else:
+                    display_value = str(value)
+                    
+                params.append(f"• <b>{name}</b> ({value_type}): {display_value}")
+        
+        # Разбиваем на части из-за ограничения длины сообщения
+        chunk_size = 15
+        for i in range(0, len(params), chunk_size):
+            chunk = params[i:i + chunk_size]
+            response = "⚙️ <b>Доступные параметры:</b>\n\n" + "\n".join(chunk)
+            if i + chunk_size < len(params):
+                response += "\n\n<i>Продолжение следует...</i>"
+            await message.answer(response, parse_mode="HTML")
+
+    async def handle_param_info(self, message: Message) -> None:
+        """Показывает детальную информацию о параметре"""
+        if not await self.is_owner(message):
+            return
+            
+        if message.text is None:
+            await message.answer("❌ Неверный формат команды")
+            return
+            
+        args = message.text.split()
+        if len(args) < 2:
+            await message.answer("❌ Укажите имя параметра")
+            return
+            
+        param_name = args[1].upper()
+        
+        if not hasattr(self.config, param_name):
+            await message.answer(f"❌ Параметр {param_name} не существует")
+            return
+            
+        value = getattr(self.config, param_name)
+        value_type = type(value).__name__
+        
+        # Получаем описание типа
+        type_description = {
+            'int': 'целое число',
+            'float': 'число с плавающей точкой',
+            'bool': 'логическое значение (true/false)',
+            'str': 'строка',
+            'list': 'список значений (через запятую)',
+            'tuple': 'кортеж чисел (через запятую)'
+        }.get(value_type, value_type)
+        
+        # Форматируем примеры значений
+        examples = {
+            int: "42",
+            float: "3.14",
+            bool: "true или false",
+            str: "любая строка",
+            list: "item1, item2, item3",
+            tuple: "255, 255, 255"
+        }.get(type(value), str(value))
+        
+        response = (
+            f"ℹ️ <b>Информация о параметре:</b>\n\n"
+            f"<b>Имя:</b> {param_name}\n"
+            f"<b>Тип:</b> {value_type} ({type_description})\n"
+            f"<b>Текущее значение:</b> {value}\n\n"
+            f"<b>Примеры значений:</b>\n"
+            f"{examples}\n\n"
+            f"<b>Изменить командой:</b>\n"
+            f"<code>/set_all {param_name} [новое_значение]</code>"
+        )
+        
+        await message.answer(response, parse_mode="HTML")
+
+    async def handle_set_all(self, message: Message) -> None:
+        """Изменяет любой параметр конфигурации"""
+        if not await self.is_owner(message):
+            return
+            
+        if message.text is None:
+            await message.answer("❌ Неверный формат команды")
+            return
+            
+        args = message.text.split()
+        if len(args) < 3:
+            await message.answer("❌ Используйте: /set_all [параметр] [значение]")
+            return
+            
+        param_name = args[1].upper()
+        new_value_str = " ".join(args[2:])
+        
+        if not hasattr(self.config, param_name):
+            await message.answer(f"❌ Параметр {param_name} не существует")
+            return
+            
+        current_value = getattr(self.config, param_name)
+        value_type = type(current_value)
+        
+        try:
+            # Преобразование типа
+            if value_type is bool:
+                converted_value = new_value_str.lower() in ['true', '1', 'yes', 'y', 't', 'on']
+            elif value_type is int:
+                converted_value = int(new_value_str)
+            elif value_type is float:
+                converted_value = float(new_value_str)
+            elif value_type is list:
+                converted_value = [item.strip() for item in new_value_str.split(',')]
+            elif value_type is tuple:
+                converted_value = tuple(map(int, new_value_str.split(',')))
+            elif value_type is str:
+                converted_value = new_value_str
+            else:
+                # Попытка преобразования для неизвестных типов
+                converted_value = value_type(new_value_str)
+            
+            # Установка нового значения
+            setattr(self.config, param_name, converted_value)
+            
+            # Сохранение в .env файл
+            self.config.save_to_env_file(param_name, str(converted_value))
+            
+            # Форматирование ответа
+            response = (
+                f"✅ <b>Параметр успешно обновлен!</b>\n\n"
+                f"<b>Параметр:</b> {param_name}\n"
+                f"<b>Старое значение:</b> {current_value}\n"
+                f"<b>Новое значение:</b> {converted_value}\n\n"
+            )
+            
+            # Предупреждение для критичных параметров
+            critical_params = ['TOKEN', 'CHANNEL_ID', 'OWNER_ID', 'YANDEX_API_KEY']
+            if param_name in critical_params:
+                response += "⚠️ <i>Для применения изменений может потребоваться перезагрузка бота</i>"
+            
+            await message.answer(response, parse_mode="HTML")
+        except (TypeError, ValueError) as e:
+            await message.answer(
+                f"❌ <b>Ошибка преобразования значения:</b>\n"
+                f"Параметр: {param_name}\n"
+                f"Требуемый тип: {value_type.__name__}\n"
+                f"Ошибка: {str(e)}",
+                parse_mode="HTML"
+            )
 
     async def close(self) -> None:
         await self.bot.session.close()
