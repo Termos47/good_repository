@@ -3,31 +3,39 @@ import os
 import logging
 from datetime import datetime
 import hashlib
-from typing import Dict, Any, Set, Tuple
+from typing import Dict, Any, Optional, List
 import shutil
 import re
 from collections import OrderedDict
+from pathlib import Path
+import tempfile
 
 logger = logging.getLogger('StateManager')
 
 class StateManager:
     """
-    Менеджер состояния бота с защитой от повреждения данных и автоматическим восстановлением
+    Улучшенный менеджер состояния бота с расширенными возможностями
     
-    Особенности:
-    - Безопасное сохранение через временные файлы
-    - Автоматическое восстановление при повреждении файла состояния
-    - Ограничение размера истории
-    - Проверка целостности данных
-    - Резервное копирование при ошибках
-    - Поддержка миграции старых форматов состояния
+    Основные улучшения:
+    - Поддержка Path для работы с файлами
+    - Более безопасное создание временных файлов
+    - Улучшенная валидация состояния
+    - Поддержка сжатия старых записей
+    - Расширенное логирование
+    - Оптимизированное управление памятью
+    - Поддержка контекстного менеджера
     """
     
-    def __init__(self, state_file: str = 'bot_state.json', max_entries: int = 1000):
-        self.state_file = state_file
+    VERSION = 1.3
+    DEFAULT_MAX_ENTRIES = 1000
+    BACKUP_DIR = "state_backups"
+    
+    def __init__(self, state_file: str = 'bot_state.json', max_entries: int = DEFAULT_MAX_ENTRIES):
+        self.state_file = Path(state_file)
         self.max_entries = max_entries
-        self.backup_dir = "state_backups"
-        self.logger = logging.getLogger('StateManager')
+        self.backup_dir = Path(self.BACKUP_DIR)
+        self._temp_dir = Path(tempfile.gettempdir())
+        self._lock_file = self.state_file.with_suffix('.lock')
         
         # Инициализация состояния по умолчанию
         self.state: Dict[str, Any] = {
@@ -35,160 +43,358 @@ class StateManager:
             'sent_hashes': OrderedDict(),
             'stats': {},
             'metadata': {
-                'version': 1.2,
-                'created_at': datetime.now().isoformat(),
-                'last_modified': None
+                'version': self.VERSION,
+                'created_at': self._current_timestamp(),
+                'last_modified': None,
+                'initialized': True
             }
         }
         
-        self._ensure_backup_dir()
+        self._ensure_directories()
         self.load_state()
 
-    def _ensure_backup_dir(self) -> None:
-        """Создает директорию для резервных копий при необходимости"""
-        os.makedirs(self.backup_dir, exist_ok=True)
+    def __enter__(self):
+        """Поддержка контекстного менеджера для автоматического сохранения"""
+        return self
 
-    def _create_backup(self) -> str:
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Автоматическое сохранение при выходе из контекста"""
+        if exc_type is None:
+            self.save_state()
+        return False
+
+    @staticmethod
+    def _current_timestamp() -> str:
+        """Возвращает текущую временную метку в ISO формате"""
+        return datetime.now().isoformat()
+
+    def _ensure_directories(self) -> None:
+        """Создает необходимые директории"""
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            if self.state_file.parent:
+                self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.error(f"Directory creation failed: {e}")
+            raise
+
+    def _create_backup(self) -> Optional[Path]:
         """Создает резервную копию текущего состояния"""
+        if not self.state_file.exists():
+            return None
+            
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = os.path.join(self.backup_dir, f"state_backup_{timestamp}.json")
-        if os.path.exists(self.state_file):
+        backup_file = self.backup_dir / f"state_backup_{timestamp}.json"
+        
+        try:
             shutil.copy2(self.state_file, backup_file)
-            self.logger.info(f"Created state backup: {backup_file}")
-        return backup_file
+            logger.info(f"Created state backup: {backup_file}")
+            return backup_file
+        except Exception as e:
+            logger.error(f"Backup creation failed: {e}")
+            return None
 
     def _validate_state(self, state: Dict[str, Any]) -> bool:
-        """Проверяет целостность структуры состояния"""
+        """Расширенная проверка целостности структуры состояния"""
         try:
             # Проверка наличия обязательных ключей
-            required_keys = ['sent_entries', 'sent_hashes', 'stats', 'metadata']
-            for key in required_keys:
-                if key not in state:
-                    self.logger.warning(f"Missing required key in state: {key}")
-                    return False
-                    
-            # Проверка типов
-            if not isinstance(state['sent_entries'], dict):
-                self.logger.warning("sent_entries should be a dictionary")
+            required_keys = {'sent_entries', 'sent_hashes', 'stats', 'metadata'}
+            if not required_keys.issubset(state.keys()):
+                missing = required_keys - state.keys()
+                logger.warning(f"Missing required keys in state: {missing}")
                 return False
                 
-            if not isinstance(state['sent_hashes'], dict):
-                self.logger.warning("sent_hashes should be a dictionary")
-                return False
-                
-            if not isinstance(state['stats'], dict):
-                self.logger.warning("stats should be a dictionary")
-                return False
-                
-            # Проверка формата записей
-            for key, value in state['sent_entries'].items():
-                if not re.match(r'^[a-f0-9]{32,64}$', key):
-                    self.logger.warning(f"Invalid entry key format: {key}")
-                    return False
-                if not isinstance(value, str):
-                    self.logger.warning(f"Invalid entry value type: {type(value)}")
+            # Проверка типов основных структур
+            type_checks = [
+                ('sent_entries', dict),
+                ('sent_hashes', dict),
+                ('stats', dict),
+                ('metadata', dict)
+            ]
+            
+            for key, expected_type in type_checks:
+                if not isinstance(state[key], expected_type):
+                    logger.warning(f"{key} should be a {expected_type.__name__}")
                     return False
                     
-            # Проверка формата хешей
-            for key, value in state['sent_hashes'].items():
-                if not re.match(r'^[a-f0-9]{64}$', key):
-                    self.logger.warning(f"Invalid hash key format: {key}")
-                    return False
-                if not isinstance(value, str):
-                    self.logger.warning(f"Invalid hash value type: {type(value)}")
+            # Проверка формата записей и хешей
+            for key in state['sent_entries']:
+                if not self._is_valid_entry_id(key):
+                    logger.warning(f"Invalid entry key format: {key}")
                     return False
                     
+            for key in state['sent_hashes']:
+                if not self._is_valid_hash(key):
+                    logger.warning(f"Invalid hash key format: {key}")
+                    return False
+                    
+            # Проверка метаданных
+            metadata = state['metadata']
+            if not isinstance(metadata.get('version'), (int, float)):
+                logger.warning("Invalid version in metadata")
+                return False
+                
             return True
         except Exception as e:
-            self.logger.error(f"Validation error: {str(e)}")
+            logger.error(f"Validation error: {str(e)}", exc_info=True)
             return False
 
+    @staticmethod
+    def _is_valid_entry_id(entry_id: str) -> bool:
+        """Проверяет валидность ID записи"""
+        return isinstance(entry_id, str) and bool(entry_id)
+
+    @staticmethod
+    def _is_valid_hash(hash_value: str) -> bool:
+        """Проверяет валидность хеш-значения"""
+        return isinstance(hash_value, str) and len(hash_value) == 64 and bool(re.match(r'^[a-f0-9]{64}$', hash_value))
+
+    def _acquire_lock(self) -> bool:
+        """Пытается получить файловую блокировку"""
+        try:
+            if self._lock_file.exists():
+                return False
+                
+            self._lock_file.touch()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to acquire lock: {e}")
+            return False
+
+    def _release_lock(self) -> None:
+        """Освобождает файловую блокировку"""
+        try:
+            if self._lock_file.exists():
+                self._lock_file.unlink()
+        except Exception as e:
+            logger.error(f"Failed to release lock: {e}")
+
     def load_state(self) -> None:
-        """Безопасная загрузка состояния из файла с восстановлением при ошибках"""
-        if not os.path.exists(self.state_file):
-            self.logger.info("No state file found, starting with fresh state")
+        """Безопасная загрузка состояния с улучшенной обработкой ошибок"""
+        if not self.state_file.exists():
+            logger.info("No state file found, starting with fresh state")
             return
             
         try:
             # Чтение с проверкой содержимого
-            with open(self.state_file, 'r', encoding='utf-8') as f:
+            with self.state_file.open('r', encoding='utf-8') as f:
                 data = f.read()
                 
-            # Проверка на пустой файл
             if not data.strip():
                 raise ValueError("State file is empty")
                 
-            # Парсинг JSON
-            loaded_state = json.loads(data)
+            loaded_state = json.loads(data, object_pairs_hook=OrderedDict)
             
-            # Обработка старого формата состояния (v1.0)
-            if 'sent_entries' in loaded_state and isinstance(loaded_state['sent_entries'], list):
-                self.logger.warning("Legacy state format detected, converting to new format...")
-                loaded_state = self._convert_legacy_state(loaded_state)
-            
-            # Для совместимости с предыдущими версиями
-            if 'metadata' not in loaded_state:
-                loaded_state['metadata'] = {
-                    'version': 1.0,
-                    'created_at': datetime.now().isoformat(),
-                    'last_modified': None
-                }
-                
-            # Добавляем отсутствующие разделы
-            if 'sent_hashes' not in loaded_state:
-                loaded_state['sent_hashes'] = OrderedDict()
-                
-            if 'stats' not in loaded_state:
-                loaded_state['stats'] = {}
-                
-            # Обновление последнего изменения
-            loaded_state['metadata']['last_modified'] = datetime.now().isoformat()
-            
-            # Преобразование в OrderedDict для сохранения порядка
-            if isinstance(loaded_state['sent_entries'], dict):
-                loaded_state['sent_entries'] = OrderedDict(
-                    sorted(loaded_state['sent_entries'].items(), key=lambda x: x[1]))
-                
-            if isinstance(loaded_state['sent_hashes'], dict):
-                loaded_state['sent_hashes'] = OrderedDict(
-                    sorted(loaded_state['sent_hashes'].items(), key=lambda x: x[1]))
+            # Обработка миграций для разных версий
+            loaded_state = self._migrate_state(loaded_state)
             
             # Проверка целостности
             if not self._validate_state(loaded_state):
-                raise ValueError("Invalid state structure after conversion")
+                raise ValueError("Invalid state structure")
                 
             self.state = loaded_state
-            self.logger.info(f"State loaded successfully from {self.state_file}")
-            self.logger.debug(f"State contains {len(self.state['sent_entries'])} entries and {len(self.state['sent_hashes'])} hashes")
+            logger.info(f"State loaded successfully from {self.state_file}")
             
         except Exception as e:
-            # Создаем резервную копию поврежденного файла
             backup_file = self._create_backup()
-            self.logger.error(f"Failed to load state: {str(e)}. Backup created: {backup_file}")
+            logger.error(f"Failed to load state: {str(e)}. Backup created: {backup_file}")
             
-            # Создаем чистое состояние
+            # Создаем чистое состояние с информацией о восстановлении
             self.state = {
                 'sent_entries': OrderedDict(),
                 'sent_hashes': OrderedDict(),
                 'stats': {},
                 'metadata': {
-                    'version': 1.2,
-                    'created_at': datetime.now().isoformat(),
+                    'version': self.VERSION,
+                    'created_at': self._current_timestamp(),
                     'last_modified': None,
-                    'recovery_reason': f"Original state corrupted: {str(e)}"
+                    'recovery_reason': f"Original state corrupted: {str(e)}",
+                    'backup_file': str(backup_file) if backup_file else None
                 }
             }
-            self.logger.info("Starting with fresh state after recovery")
+
+    def _migrate_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Выполняет миграцию состояния из старых версий"""
+        version = state.get('metadata', {}).get('version', 1.0)
+        
+        # Миграция с версии 1.0
+        if version < 1.1:
+            logger.info(f"Migrating state from version {version} to 1.1")
+            if 'sent_entries' in state and isinstance(state['sent_entries'], list):
+                state = self._convert_legacy_state(state)
+                
+        # Миграция с версии 1.1 и 1.2
+        if version < self.VERSION:
+            logger.info(f"Migrating state from version {version} to {self.VERSION}")
+            state['metadata']['version'] = self.VERSION
+            state['metadata'].setdefault('initialized', True)
+            
+        return state
+
+    def save_state(self) -> bool:
+        """Безопасное сохранение состояния с использованием временного файла и блокировки"""
+        if not self._acquire_lock():
+            logger.warning("Could not acquire lock for saving state")
+            return False
+            
+        try:
+            # Обновляем метаданные
+            self.state['metadata'].update({
+                'last_modified': self._current_timestamp(),
+                'entries_count': len(self.state['sent_entries']),
+                'hashes_count': len(self.state['sent_hashes'])
+            })
+            
+            # Создаем временный файл в безопасном месте
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                encoding='utf-8',
+                dir=self._temp_dir,
+                suffix='.tmp',
+                delete=False
+            ) as tmp_file:
+                temp_path = Path(tmp_file.name)
+                json.dump(self.state, tmp_file, indent=2, ensure_ascii=False)
+                
+            # Проверяем целостность временного файла
+            with temp_path.open('r') as f:
+                json.load(f)  # Проверка на валидность JSON
+                
+            # Переносим временный файл в конечное расположение
+            temp_path.replace(self.state_file)
+            logger.info(f"State saved successfully to {self.state_file}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving state: {str(e)}", exc_info=True)
+            self._create_backup()
+            return False
+        finally:
+            self._release_lock()
+
+    def is_entry_sent(self, entry_id: str) -> bool:
+        """Проверяет, был ли отправлен пост с данным ID"""
+        return entry_id in self.state.get('sent_entries', {})
+
+    def add_sent_entry(self, post: Dict) -> None:
+        """Добавляет отправленный пост в историю"""
+        post_id = post.get('post_id')
+        if not post_id:
+            logger.warning("Cannot add entry without post_id")
+            return
+            
+        timestamp = self._current_timestamp()
+        self.state['sent_entries'][post_id] = timestamp
+        
+        # Добавляем хеш контента
+        content_hash = self._generate_content_hash(post)
+        if content_hash:
+            self.state['sent_hashes'][content_hash] = timestamp
+            
+        # Автоматическая очистка старых записей
+        if len(self.state['sent_entries']) > self.max_entries * 1.2:
+            self.cleanup_old_entries()
+
+    def _generate_content_hash(self, post: Dict) -> Optional[str]:
+        """Генерирует хеш для контента поста"""
+        try:
+            content = f"{post.get('title', '')}{post.get('description', '')}"
+            return hashlib.sha256(content.encode()).hexdigest()
+        except Exception as e:
+            logger.error(f"Failed to generate content hash: {e}")
+            return None
+
+    def is_hash_sent(self, hash_value: str) -> bool:
+        """Проверяет, был ли хеш контента уже обработан"""
+        return self._is_valid_hash(hash_value) and hash_value in self.state.get('sent_hashes', {})
+
+    def cleanup_old_entries(self) -> int:
+        """Очищает старые записи, возвращает количество удаленных"""
+        current_count = len(self.state['sent_entries'])
+        if current_count <= self.max_entries:
+            return 0
+            
+        to_remove = current_count - self.max_entries
+        removed_entries = 0
+        removed_hashes = 0
+        
+        # Удаляем старые записи
+        while len(self.state['sent_entries']) > self.max_entries:
+            self.state['sent_entries'].popitem(last=False)
+            removed_entries += 1
+            
+        # Удаляем старые хеши (если их слишком много)
+        if len(self.state['sent_hashes']) > self.max_entries * 1.5:
+            oldest_entry_time = next(iter(self.state['sent_entries'].values()), None)
+            if oldest_entry_time:
+                hashes_to_remove = [
+                    h for h, t in self.state['sent_hashes'].items()
+                    if t < oldest_entry_time
+                ]
+                for h in hashes_to_remove[:to_remove]:
+                    self.state['sent_hashes'].pop(h, None)
+                    removed_hashes += 1
+                    
+        logger.info(f"Cleaned up {removed_entries} entries and {removed_hashes} hashes")
+        return removed_entries + removed_hashes
+
+    def compress_state(self) -> None:
+        """Сжимает состояние, удаляя дубликаты и оптимизируя структуру"""
+        # Удаляем записи, для которых есть хеш, но нет самого entry
+        hashes_to_keep = {
+            self._generate_content_hash({'title': '', 'description': k})
+            for k in self.state['sent_entries']
+        }
+        
+        # Оставляем только актуальные хеши
+        self.state['sent_hashes'] = OrderedDict(
+            (k, v) for k, v in self.state['sent_hashes'].items()
+            if k in hashes_to_keep
+        )
+        
+        # Оптимизируем статистику
+        if 'stats' in self.state and not self.state['stats']:
+            del self.state['stats']
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Возвращает расширенную статистику состояния"""
+        entries = self.state.get('sent_entries', {})
+        hashes = self.state.get('sent_hashes', {})
+        metadata = self.state.get('metadata', {})
+        
+        return {
+            'entries_count': len(entries),
+            'hashes_count': len(hashes),
+            'oldest_entry': next(iter(entries.values()), None) if entries else None,
+            'newest_entry': next(reversed(entries.values()), None) if entries else None,
+            'version': metadata.get('version', 'unknown'),
+            'last_modified': metadata.get('last_modified', 'never'),
+            'initialized': metadata.get('initialized', False),
+            'state_file': str(self.state_file.absolute()),
+            'backups_count': len(list(self.backup_dir.glob('*.json'))) if self.backup_dir.exists() else 0
+        }
+
+    def update_stats(self, stats: Dict[str, Any]) -> None:
+        """Обновляет статистику в состоянии (добавлен для совместимости)"""
+        if not isinstance(stats, dict):
+            logger.warning("Stats should be a dictionary")
+            return
+            
+        if 'stats' not in self.state:
+            self.state['stats'] = {}
+        
+        self.state['stats'].update(stats)
+        logger.debug(f"Updated stats with {len(stats)} items")
 
     def _convert_legacy_state(self, legacy_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Конвертирует старый формат состояния в новый"""
+        """Конвертирует старый формат состояния в новый (добавлен для совместимости)"""
         new_state = {
             'sent_entries': OrderedDict(),
             'sent_hashes': OrderedDict(),
             'stats': legacy_state.get('stats', {}),
             'metadata': {
-                'version': 1.2,
-                'created_at': datetime.now().isoformat(),
+                'version': self.VERSION,
+                'created_at': self._current_timestamp(),
                 'last_modified': None,
                 'converted_from_legacy': True
             }
@@ -198,158 +404,42 @@ class StateManager:
         for entry in legacy_state.get('sent_entries', []):
             if isinstance(entry, dict) and 'post_id' in entry:
                 post_id = entry['post_id']
-                pub_date = entry.get('pub_date', datetime.now().isoformat())
+                pub_date = entry.get('pub_date', self._current_timestamp())
                 new_state['sent_entries'][post_id] = pub_date
         
         # Перенос хешей, если есть
         if 'entry_hashes' in legacy_state and isinstance(legacy_state['entry_hashes'], list):
             for hash_val in legacy_state['entry_hashes']:
-                if re.match(r'^[a-f0-9]{64}$', hash_val):
-                    new_state['sent_hashes'][hash_val] = datetime.now().isoformat()
-        
-        # Перенос дополнительных полей
-        for key in ['yagpt_cache', 'yagpt_error_count', 'yagpt_active', 'user_settings']:
-            if key in legacy_state:
-                new_state[key] = legacy_state[key]
+                if self._is_valid_hash(hash_val):
+                    new_state['sent_hashes'][hash_val] = self._current_timestamp()
         
         return new_state
 
-    def save_state(self) -> None:
-        """Безопасное сохранение состояния через временный файл"""
+    def list_backups(self) -> List[Path]:
+        """Возвращает список доступных резервных копий"""
+        if not self.backup_dir.exists():
+            return []
+        return sorted(self.backup_dir.glob('state_backup_*.json'), reverse=True)
+
+    def restore_from_backup(self, backup_path: Path) -> bool:
+        """Восстанавливает состояние из резервной копии"""
         try:
-            # Исправление: создаем директорию только если путь указан
-            if os.path.dirname(self.state_file):
-                os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-            
-            # Обновляем метаданные
-            self.state['metadata']['last_modified'] = datetime.now().isoformat()
-            self.state['metadata']['entries_count'] = len(self.state['sent_entries'])
-            self.state['metadata']['hashes_count'] = len(self.state['sent_hashes'])
-            
-            # Создаем временный файл
-            temp_file = f"{self.state_file}.tmp"
-            
-            # Сохраняем во временный файл
-            with open(temp_file, 'w', encoding='utf-8') as f: 
-                json.dump(self.state, f, indent=2, ensure_ascii=False)
-                
-            # Проверяем целостность временного файла
-            with open(temp_file, 'r') as f:
+            with backup_path.open('r', encoding='utf-8') as f:
                 data = f.read()
-                json.loads(data)  # Проверка на валидность JSON
                 
-            # Заменяем основной файл
-            if os.path.exists(self.state_file):
-                os.replace(temp_file, self.state_file)
-            else:
-                os.rename(temp_file, self.state_file)
+            if not data.strip():
+                raise ValueError("Backup file is empty")
                 
-            self.logger.info(f"State saved to {self.state_file}")
+            loaded_state = json.loads(data, object_pairs_hook=OrderedDict)
+            
+            if not self._validate_state(loaded_state):
+                raise ValueError("Invalid backup state structure")
+                
+            self.state = loaded_state
+            self.save_state()
+            logger.info(f"Successfully restored state from backup: {backup_path}")
+            return True
             
         except Exception as e:
-            self.logger.error(f"Error saving state: {str(e)}", exc_info=True)
-            # Создаем резервную копию при ошибке сохранения
-            self._create_backup()
-
-    def is_entry_sent(self, entry_id: str) -> bool:
-        return entry_id in self.state.get('sent_entries', {})
-
-    def normalize_url(self, url: str) -> str:
-        """Нормализация URL для сравнения"""
-        return url.lower().strip().replace("https://", "").replace("http://", "").rstrip('/')
-
-    def find_similar_titles(self, title: str, threshold: float, max_check: int) -> bool:
-        """Заглушка для проверки схожести заголовков"""
-        # В реальной реализации здесь должна быть логика сравнения заголовков
-        return False
-
-    def add_sent_entry(self, post: Dict) -> None:
-        """Добавление отправленного поста в историю"""
-        post_id = post.get('post_id', '')
-        if post_id:
-            sent_entries = self.state.setdefault('sent_entries', OrderedDict())
-            sent_entries[post_id] = datetime.now().isoformat()
-            
-            # Обновляем хеш для контента
-            content_hash = self._generate_content_hash(post)
-            if content_hash:
-                self.state.setdefault('sent_hashes', OrderedDict())[content_hash] = datetime.now().isoformat()
-
-    def _generate_content_hash(self, post: Dict) -> str:
-        """Генерирует хеш для контента поста"""
-        content = f"{post.get('title', '')}{post.get('description', '')}"
-        return hashlib.sha256(content.encode()).hexdigest()
-
-    def is_hash_sent(self, hash_value: str) -> bool:
-        """Проверяет, был ли хеш контента уже обработан"""
-        return hash_value in self.state.get('sent_hashes', {})
-
-    def add_entry(self, entry_id: str, hash_value: str) -> None:
-        """
-        Добавляет запись в историю с проверкой данных
-        
-        :param entry_id: Уникальный ID записи (обычно URL)
-        :param hash_value: SHA-256 хеш контента
-        """
-        # Проверка входных данных
-        if not isinstance(entry_id, str) or not entry_id:
-            self.logger.error(f"Invalid entry_id: {entry_id}")
-            return
-            
-        if not isinstance(hash_value, str) or len(hash_value) != 64 or not re.match(r'^[a-f0-9]{64}$', hash_value):
-            self.logger.error(f"Invalid hash format: {hash_value}")
-            return
-            
-        # Добавляем с временной меткой
-        timestamp = datetime.now().isoformat()
-        self.state['sent_entries'][entry_id] = timestamp
-        self.state['sent_hashes'][hash_value] = timestamp
-        
-        # Сохраняем состояние
-        self.save_state()
-        
-        self.logger.debug(f"Added entry: {entry_id[:30]}... with hash: {hash_value[:10]}...")
-
-    def cleanup_old_entries(self) -> None:
-        """Очищает старые записи, сохраняя только последние max_entries"""
-        current_count = len(self.state['sent_entries'])
-        if current_count <= self.max_entries:
-            return
-            
-        # Определяем сколько нужно удалить
-        to_remove = current_count - self.max_entries
-        
-        # Удаляем старые записи из sent_entries
-        entries_to_remove = list(self.state['sent_entries'].keys())[:to_remove]
-        for key in entries_to_remove:
-            del self.state['sent_entries'][key]
-            
-        # Собираем хеши для удаления
-        hashes_to_remove = []
-        for hash_val, timestamp in self.state['sent_hashes'].items():
-            if timestamp < self.state['sent_entries'].peekitem(0)[1]:
-                hashes_to_remove.append(hash_val)
-                
-        # Удаляем старые хеши
-        for hash_val in hashes_to_remove[:to_remove]:
-            del self.state['sent_hashes'][hash_val]
-            
-        self.logger.info(f"Cleaned up state: removed {len(entries_to_remove)} entries and {len(hashes_to_remove)} hashes")
-        self.save_state()
-
-    def update_stats(self, stats: Dict[str, Any]) -> None:
-        """Обновляет статистику в состоянии"""
-        if 'stats' not in self.state:
-            self.state['stats'] = {}
-        self.state['stats'].update(stats)
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Возвращает статистику состояния"""
-        return {
-            'entries_count': len(self.state.get('sent_entries', {})),
-            'hashes_count': len(self.state.get('sent_hashes', {})),
-            'oldest_entry': next(iter(self.state['sent_entries'].values()), None) if self.state.get('sent_entries') else None,
-            'newest_entry': next(reversed(self.state['sent_entries'].values()), None) if self.state.get('sent_entries') else None,
-            'version': self.state.get('metadata', {}).get('version', 'unknown'),
-            'last_modified': self.state.get('metadata', {}).get('last_modified', 'never')
-        }
+            logger.error(f"Failed to restore from backup: {e}")
+            return False

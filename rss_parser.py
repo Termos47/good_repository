@@ -1,3 +1,4 @@
+from concurrent.futures import ProcessPoolExecutor
 import re
 from urllib.parse import urljoin
 import feedparser
@@ -30,6 +31,8 @@ class AsyncRSSParser:
         self.session = session
         self.proxy_url = proxy_url
         self.timeout = aiohttp.ClientTimeout(total=15)
+        self.semaphore = asyncio.Semaphore(5)
+        self.executor = ProcessPoolExecutor(max_workers=2)
 
     async def fetch_feed(self, url: str) -> Optional[Dict[str, Any]]:
         """Асинхронно загружает и парсит RSS-ленту"""
