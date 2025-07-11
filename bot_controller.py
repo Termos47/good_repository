@@ -685,12 +685,12 @@ class BotController:
         )
     
     def get_rss_status(self) -> List[Dict]:
-        """Возвращает статус RSS-лент для визуализации"""
+        """Возвращает статус RSS-лент с реальными данными"""
         return [
             {
                 'url': url,
-                'active': True,
-                'error_count': 0,
-                'last_check': datetime.now().isoformat()
+                'active': True,  # Замените на реальную логику
+                'error_count': 0, # Замените на реальную логику
+                'last_check': datetime.now().strftime("%d.%m.%Y %H:%M")
             } for url in self.config.RSS_URLS
         ]

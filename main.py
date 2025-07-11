@@ -9,7 +9,8 @@ import platform
 from config import app_config as config
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Update, Message
+from aiogram.types import Update, Message, ErrorEvent
+from aiogram.exceptions import TelegramAPIError
 from config import Config
 from datetime import datetime
 from bot_controller import BotController
@@ -34,7 +35,10 @@ async def shutdown(loop, controller):
     except Exception as e:
         logger.error(f"Error during shutdown: {str(e)}")
     finally:
-        loop.stop()
+        try:
+            loop.stop()
+        except RuntimeError:
+            pass
 
 def setup_logging(debug_mode: bool = False) -> None:
     """Настройка логирования"""
@@ -137,6 +141,13 @@ async def run_bot():
             config=config
         )
         logger.info("Telegram bot initialized")
+
+        # Блокировка не-владельцев
+        @telegram_bot.dp.message()
+        async def global_blocker(message: Message):
+            if message.from_user.id != config.OWNER_ID:
+                await telegram_bot.enforce_owner_access(message)
+            return
         
         # Установка меню команд
         await telegram_bot.setup_commands()

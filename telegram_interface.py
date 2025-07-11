@@ -1,12 +1,15 @@
 from collections import deque
 import os
 import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from state_manager import StateManager
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands, CallbackQuery, InputMediaPhoto
+from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands, CallbackQuery, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import MenuButtonType
 from aiogram.filters import Command
 from config import Config
@@ -119,8 +122,10 @@ class AsyncTelegramBot:
             data = callback.data
 
             logger.debug(f"Callback от пользователя {user_id}: {data}")
-
+            
             if data == "main_menu":
+                await self.send_main_menu(user_id, chat_id)
+            elif data == "main" or data == "main_menu":
                 await self.send_main_menu(user_id, chat_id)
             elif data == "stats":
                 await self.show_statistics(callback)
@@ -134,6 +139,8 @@ class AsyncTelegramBot:
                 await self.show_image_settings(callback)
             elif data == "settings_ai":
                 await self.show_ai_settings(callback)
+            elif data == "rss_list":
+                await self.handle_rss_list(callback)
             elif data == "settings_rss":
                 await self.show_rss_settings(callback)
             elif data == "settings_notify":
@@ -142,8 +149,6 @@ class AsyncTelegramBot:
                 await self.show_theme_selector(callback)
             elif data.startswith("set_theme_"):
                 await self.set_theme(callback)
-            elif data == "rss_list":
-                await self.handle_rss_list(callback.message)
             elif data == "start_bot":
                 await self.handle_start_bot(callback)
             elif data == "stop_bot":
@@ -217,18 +222,20 @@ class AsyncTelegramBot:
         )
 
     async def show_rss_settings(self, callback: CallbackQuery) -> None:
-        """Показывает настройки RSS"""
-        text = "📡 <b>Настройки RSS</b>\n\n"
-        text += f"• Количество лент: {len(self.config.RSS_URLS)}\n"
-        text += f"• Задержка между запросами: {self.config.RSS_REQUEST_DELAY} сек\n"
-        text += "• Текущие ленты:\n"
-        
-        for i, url in enumerate(self.config.RSS_URLS[:3], 1):
-            text += f"  {i}. {url[:50]}...\n"
-        if len(self.config.RSS_URLS) > 3:
-            text += f"  ...и еще {len(self.config.RSS_URLS)-3}\n"
+        """Показывает настройки RSS с расширенной информацией"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
             
-        keyboard = await self.ui.back_to_settings()
+        feeds = self.controller.get_rss_status()
+        text = "📡 <b>Настройки RSS-лент</b>\n\n"
+        
+        for feed in feeds:
+            status = "🟢 Активна" if feed['active'] else "🔴 Неактивна"
+            errors = f" | Ошибок: {feed['error_count']}" if feed['error_count'] > 0 else ""
+            text += f"{status} | {feed['url']}{errors}\n"
+        
+        keyboard = await self.ui.back_button()
         await callback.message.edit_text(
             text=text,
             reply_markup=keyboard,
@@ -249,14 +256,18 @@ class AsyncTelegramBot:
             reply_markup=keyboard,
             parse_mode="HTML"
         )
-
+    
     async def handle_start(self, message: Message) -> None:
-        """Обработка команды /start"""
+        if not await self.enforce_owner_access(message):
+            return
         await self.send_main_menu(message.from_user.id, message.chat.id)
     
     async def send_main_menu(self, user_id: int, chat_id: int) -> None:
         """Отправляет главное меню"""
         keyboard = await self.ui.main_menu(user_id)
+        if not keyboard:
+            return  # Уже обработано в ui
+        
         await self.bot.send_message(
             chat_id=chat_id,
             text="🤖 <b>Управление RSS Ботом</b>\n\nВыберите действие:",
@@ -395,23 +406,77 @@ class AsyncTelegramBot:
         )
         await message.answer(stats, parse_mode="HTML")
 
-    async def handle_rss_list(self, message: Message) -> None:
-        """Отправляет список RSS-лент"""
-        if not await self.is_owner(message):
+    async def handle_rss_list(self, callback: CallbackQuery) -> None:
+        """Отправляет список RSS-лент как ответ на callback"""
+        if not await self.enforce_owner_access(callback):
             return
             
-        lines: List[str] = ["📚 <b>Текущие RSS-ленты:</b>"]
-        for i, url in enumerate(self.config.RSS_URLS, 1):
-            lines.append(f"{i}. {url}")
-        
-        lines.append("\nДля удаления используйте:")
-        lines.append("<code>/rss_remove [номер]</code>")
-        lines.append("Пример: <code>/rss_remove 2</code>")
-        
-        await message.answer("\n".join(lines), parse_mode="HTML")
-
+        try:
+            if not self.controller:
+                await callback.answer("⚠️ Контроллер не подключен")
+                return
+                
+            feeds = self.controller.get_rss_status()
+            lines = ["📡 <b>Статус RSS-лент</b>\n"]
+            
+            for i, feed in enumerate(feeds, 1):
+                status_icon = '🟢' if feed.get('active', True) else '🔴'
+                error_icon = f" | ❗️ {feed.get('error_count', 0)}" if feed.get('error_count', 0) > 0 else ""
+                last_check = f" | 📅 {feed.get('last_check', 'никогда')}" if feed.get('last_check') else ""
+                lines.append(f"{i}. {status_icon} {feed['url'][:50]}...{error_icon}{last_check}")
+            
+            # Создаем клавиатуру с кнопкой "Назад"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")]
+            ])
+            
+            # Отправляем сообщение
+            await callback.message.answer(
+                text="\n".join(lines),
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+            await callback.answer()
+        except Exception as e:
+            logger.error(f"Error showing RSS list: {str(e)}")
+            await callback.answer("Ошибка получения списка лент", show_alert=True)
+            
     async def is_owner(self, message: Message) -> bool:
         return message.from_user and message.from_user.id == self.config.OWNER_ID
+
+    async def enforce_owner_access(self, message_or_callback: Union[Message, CallbackQuery]) -> bool:
+        """Проверяет доступ и уведомляет о попытках несанкционированного доступа"""
+        user_id = message_or_callback.from_user.id
+        if user_id == self.config.OWNER_ID:
+            return True
+            
+        # Логирование и уведомление
+        username = f"@{message_or_callback.from_user.username}" if message_or_callback.from_user.username else "без username"
+        logger.warning(f"Unauthorized access attempt: UserID={user_id} {username}")
+        
+        # Отправка предупреждения владельцу
+        try:
+            await self.bot.send_message(
+                chat_id=self.config.OWNER_ID,
+                text=f"⚠️ *Попытка доступа!*\n"
+                    f"• Пользователь: {username}\n"
+                    f"• ID: `{user_id}`\n"
+                    f"• Команда: `{getattr(message_or_callback, 'text', message_or_callback.data)}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send owner alert: {e}")
+        
+        # Ответ нарушителю
+        try:
+            if isinstance(message_or_callback, Message):
+                await message_or_callback.answer("🚫 Доступ запрещен!")
+            else:
+                await message_or_callback.answer("🚫 Доступ запрещен!", show_alert=True)
+        except:
+            pass
+        
+        return False
 
     async def handle_rss_add(self, message: Message) -> None:
         if not await self.is_owner(message):

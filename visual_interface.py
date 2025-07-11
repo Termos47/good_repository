@@ -1,3 +1,4 @@
+from typing import Optional
 from aiogram.types import (
     InlineKeyboardMarkup, 
     InlineKeyboardButton,
@@ -50,8 +51,15 @@ class UIBuilder:
     def get_theme(self, user_id: int) -> dict:
         return self.user_themes.get(user_id, self.THEMES['default'])
     
-    async def main_menu(self, user_id: int) -> InlineKeyboardMarkup:
+    async def main_menu(self, user_id: int) -> Optional[InlineKeyboardMarkup]:
+        """Показывает главное меню только владельцу"""
+        # Проверка прав доступа
+        if user_id != self.config.OWNER_ID:
+            return None
+        
         theme = self.get_theme(user_id)
+        
+        # Основные кнопки меню
         buttons = [
             [
                 InlineKeyboardButton(
@@ -96,7 +104,25 @@ class UIBuilder:
                 )
             ]
         ]
+        
         return InlineKeyboardMarkup(inline_keyboard=buttons)
+    
+    async def back_to_settings(self) -> InlineKeyboardMarkup:
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="◀️ Назад",
+            callback_data="settings"
+        )
+        return builder.as_markup()
+    
+    async def back_button(self) -> InlineKeyboardMarkup:
+        """Кнопка 'Назад' для меню настроек"""
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="◀️ Назад",
+            callback_data="settings"
+        )
+        return builder.as_markup()
 
     async def stats_visualization(self, stats: dict) -> tuple:
         """Генерирует визуализацию статистики"""
