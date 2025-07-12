@@ -1,0 +1,13 @@
+version: "3.8"
+services:
+  rss-bot:
+    build: .
+    container_name: rss-bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./templates:/app/templates
+      - ./bot_state.json:/app/bot_state.json
+      - ./.env:/app/.env  # если нужно явно указать .env
