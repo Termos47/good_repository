@@ -1,3 +1,4 @@
+import json
 import os
 import asyncio
 import logging
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 from PIL import Image
 from functools import lru_cache
 from bs4 import BeautifulSoup
+from telegram import CallbackQuery
 from state_manager import StateManager
 
 logger = logging.getLogger('bot.controller')
@@ -684,13 +686,50 @@ class BotController:
             f"<b>Лент в обработке:</b> {len(self.config.RSS_URLS)}"
         )
     
+    async def toggle_rss_feed(self, index: int, enable: bool) -> bool:
+        """Активирует/деактивирует RSS-ленту"""
+        try:
+            if 0 <= index < len(self.config.RSS_URLS):
+                self.config.RSS_ACTIVE[index] = enable
+                self.config.save_to_env_file("RSS_ACTIVE", str(self.config.RSS_ACTIVE))
+                
+                # Обновляем парсер
+                self.rss_parser.set_feed_status(
+                    self.config.RSS_URLS[index], 
+                    enable
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Ошибка переключения ленты: {str(e)}")
+            return False
+    def update_rss_state(self, urls: List[str], active: List[bool]):
+        """Обновляет состояние RSS лент"""
+        self.config.RSS_URLS = urls
+        self.config.RSS_ACTIVE = active
+        self.config.save_to_env_file("RSS_URLS", json.dumps(urls))
+        self.config.save_to_env_file("RSS_ACTIVE", json.dumps(active))
+        
+        # Обновляем статусы в парсере
+        for i, url in enumerate(urls):
+            self.rss_parser.set_feed_status(url, active[i])
+    
+    def get_rss_state(self) -> Tuple[List[str], List[bool]]:
+        """Возвращает текущее состояние RSS"""
+        
+        return self.config.RSS_URLS, self.config.RSS_ACTIVE
     def get_rss_status(self) -> List[Dict]:
-        """Возвращает статус RSS-лент с реальными данными"""
+        """Возвращает статус с учетом активности"""
         return [
             {
                 'url': url,
-                'active': True,  # Замените на реальную логику
-                'error_count': 0, # Замените на реальную логику
-                'last_check': datetime.now().strftime("%d.%m.%Y %H:%M")
-            } for url in self.config.RSS_URLS
+                'active': self.config.RSS_ACTIVE[i],
+                'error_count': self.rss_parser.get_error_count(url),
+                'last_check': self.rss_parser.get_last_check(url) if hasattr(self.rss_parser, 'get_last_check') else None
+            } for i, url in enumerate(self.config.RSS_URLS)
         ]
+    
+    async def show_ai_settings(self, callback: CallbackQuery) -> None:
+        """Показывает настройки AI (перенаправляем в Telegram интерфейс)"""
+        # Этот метод теперь полностью реализован в Telegram интерфейсе
+        pass

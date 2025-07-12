@@ -1,3 +1,4 @@
+import asyncio
 from collections import deque
 import os
 import logging
@@ -155,6 +156,63 @@ class AsyncTelegramBot:
                 await self.handle_stop_bot(callback)
             elif data == "back_to_settings":
                 await self.show_settings_menu(callback)
+            
+            # Основные настройки
+            elif data == "settings_general":
+                await self.show_general_settings(callback)
+            elif data == "edit_general_settings":
+                await self.edit_general_settings(callback)
+            elif data.startswith("edit_general_"):
+                await self.edit_general_param(callback)
+            elif data.startswith("set_general_"):
+                await self.set_general_param(callback)
+            elif data == "save_general_settings":
+                await self.save_general_settings(callback)
+            elif data == "cancel_general_edit":
+                await self.cancel_general_edit(callback)
+
+            # AI настройки
+            elif data == "settings_ai":
+                await self.show_ai_settings(callback)
+            elif data == "edit_ai_settings":
+                await self.edit_ai_settings(callback)
+            elif data == "save_ai_settings":
+                await self.save_ai_settings(callback)
+            elif data == "cancel_ai_edit":
+                await self.cancel_ai_edit(callback)
+            elif data.startswith("edit_ai_"):  # edit_ai_model, edit_ai_temp, edit_ai_tokens
+                await self.edit_ai_param(callback)
+            elif data.startswith("set_ai_model:"):
+                await self.set_ai_model(callback)
+            elif data.startswith("set_ai_temp:"):
+                await self.set_ai_temp(callback)
+            elif data == "set_ai_temp_custom":
+                await self.set_ai_temp_custom(callback)
+            elif data.startswith("set_ai_tokens:"):
+                await self.set_ai_tokens(callback)
+            elif data == "set_ai_tokens_custom":
+                await self.set_ai_tokens_custom(callback)
+            
+            # RSS настройки
+            # RSS настройки
+            elif data == "settings_rss":
+                await self.show_rss_settings(callback)
+            elif data == "edit_rss_settings":
+                await self.show_rss_settings(callback, edit_mode=True)
+            elif data == "save_rss_settings":
+                await callback.answer("Настройки RSS сохранены")
+                await self.show_rss_settings(callback)
+            elif data == "rss_add_start":
+                await self.start_rss_add(callback)
+            elif data == "rss_remove_start":
+                await self.start_rss_remove(callback)
+            elif data.startswith("rss_remove_"):
+                await self.confirm_rss_remove(callback)
+            elif data.startswith("rss_toggle_"):
+                await self.toggle_rss_feed(callback)
+            elif data == "rss_refresh":
+                await self.refresh_rss_status(callback)
+
             else:
                 logger.warning(f"Неизвестный callback: {data}")
                 await callback.answer("Функция в разработке")
@@ -204,43 +262,311 @@ class AsyncTelegramBot:
             parse_mode="HTML"
         )
 
-    async def show_ai_settings(self, callback: CallbackQuery) -> None:
+    async def show_ai_settings(self, callback: CallbackQuery, edit_mode: bool = False) -> None:
         """Показывает настройки AI"""
-        text = (
-            "🧠 <b>Настройки YandexGPT</b>\n\n"
-            f"• Модель: {self.config.YAGPT_MODEL}\n"
-            f"• Температура: {self.config.YAGPT_TEMPERATURE}\n"
-            f"• Макс. токенов: {self.config.YAGPT_MAX_TOKENS}\n"
-            f"• Статус: {'Активен' if not self.config.DISABLE_YAGPT else 'Отключен'}"
-        )
+        text, keyboard = await self.ui.ai_settings_view(callback.from_user.id, edit_mode)
         
-        keyboard = await self.ui.back_to_settings()
-        await callback.message.edit_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
+        try:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
 
-    async def show_rss_settings(self, callback: CallbackQuery) -> None:
-        """Показывает настройки RSS с расширенной информацией"""
+    async def show_general_settings(self, callback: CallbackQuery, edit_mode: bool = False):
+        """Показывает основные настройки"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        text, keyboard = await self.ui.general_settings_view(
+            callback.from_user.id, 
+            edit_mode
+        )
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    
+    async def edit_general_settings(self, callback: CallbackQuery):
+        """Вход в режим редактирования"""
+        await self.ui.start_general_edit(callback.from_user.id)
+        await self.show_general_settings(callback, edit_mode=True)
+    
+    async def edit_general_param(self, callback: CallbackQuery):
+        """Обработка выбора параметра"""
+        param = callback.data.replace("edit_general_", "")
+        keyboard = await self.ui.general_param_selector(callback.from_user.id, param)
+        await callback.message.edit_text(f"Выберите значение для {param}:", reply_markup=keyboard)
+    
+    async def set_general_param(self, callback: CallbackQuery):
+        """Установка значения параметра"""
+        _, param, value = callback.data.split("_", 2)
+        param = param.lower()
+        value = float(value) if "." in value else int(value)
+        
+        await self.ui.update_general_setting(
+            callback.from_user.id,
+            param,
+            value
+        )
+        await self.show_general_settings(callback, edit_mode=True)
+        await callback.answer(f"Значение обновлено: {value}")
+    
+    async def save_general_settings(self, callback: CallbackQuery):
+        """Сохранение изменений"""
+        try:
+            changes = await self.ui.save_general_settings(callback.from_user.id)
+            if not changes:
+                await callback.answer("Настройки не изменены")
+                return
+            
+            # Применение изменений в конфигурации
+            for param, value in changes.items():
+                self.config.update_param(param, value)
+            
+            # Формирование отчета
+            changes_text = "\n".join([f"• {param}: {value}" for param, value in changes.items()])
+            text = f"✅ Основные настройки обновлены:\n\n{changes_text}"
+            
+            await callback.message.edit_text(text)
+            await asyncio.sleep(3)
+            await self.show_general_settings(callback)
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения: {str(e)}")
+            await callback.answer("Ошибка сохранения настроек", show_alert=True)
+
+    async def edit_ai_settings(self, callback: CallbackQuery) -> None:
+        """Переходит в режим редактирования настроек AI"""
+        await self.ui.start_ai_edit(callback.from_user.id)
+        await self.show_ai_settings(callback, edit_mode=True)
+        await callback.answer()
+
+    async def edit_ai_param(self, callback: CallbackQuery) -> None:
+        """Обрабатывает выбор параметра для редактирования"""
+        param_type = callback.data.replace("edit_ai_", "")
+        user_id = callback.from_user.id
+        
+        if param_type == "model":
+            keyboard = await self.ui.ai_model_selector(user_id)
+            text = "Выберите модель:"
+        elif param_type == "temp":
+            keyboard = await self.ui.ai_temp_selector(user_id)
+            text = "Выберите температуру (0.1-1.0):"
+        elif param_type == "tokens":
+            keyboard = await self.ui.ai_tokens_selector(user_id)
+            text = "Выберите максимальное количество токенов:"
+        else:
+            await callback.answer("Неизвестный параметр")
+            return
+        
+        try:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except Exception:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        await callback.answer()
+
+    async def set_ai_model(self, callback: CallbackQuery) -> None:
+        """Устанавливает выбранную модель"""
+        model = callback.data.split(":")[1]
+        await self.ui.update_ai_setting(callback.from_user.id, "model", model)
+        await self.show_ai_settings(callback, edit_mode=True)
+        await callback.answer(f"Модель изменена на {model}")
+
+    async def set_ai_temp(self, callback: CallbackQuery) -> None:
+        """Устанавливает температуру из предустановленных значений"""
+        temp = float(callback.data.split(":")[1])
+        await self.ui.update_ai_setting(callback.from_user.id, "temperature", temp)
+        await self.show_ai_settings(callback, edit_mode=True)
+        await callback.answer(f"Температура изменена на {temp}")
+
+    async def set_ai_temp_custom(self, callback: CallbackQuery) -> None:
+        """Запрашивает ручной ввод температуры"""
+        await callback.message.answer(
+            "Введите значение температуры (0.1-1.0):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_ai_settings")]]
+            )
+        )
+        # Здесь будет логика ожидания ввода пользователя (реализуется в handle_message)
+        await callback.answer()
+
+    async def set_ai_tokens(self, callback: CallbackQuery) -> None:
+        """Устанавливает токены из предустановленных значений"""
+        tokens = int(callback.data.split(":")[1])
+        await self.ui.update_ai_setting(callback.from_user.id, "max_tokens", tokens)
+        await self.show_ai_settings(callback, edit_mode=True)
+        await callback.answer(f"Макс. токенов изменено на {tokens}")
+
+    async def set_ai_tokens_custom(self, callback: CallbackQuery) -> None:
+        """Запрашивает ручной ввод количества токенов"""
+        await callback.message.answer(
+            "Введите максимальное количество токенов (500-10000):",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_ai_settings")]]
+            )
+        )
+        # Здесь будет логика ожидания ввода пользователя (реализуется в handle_message)
+        await callback.answer()
+
+    async def save_ai_settings(self, callback: CallbackQuery) -> None:
+        """Сохраняет изменения настроек AI"""
+        try:
+            changes = await self.ui.save_ai_settings(callback.from_user.id)
+            
+            if not changes:
+                await callback.answer("Настройки не изменены")
+                await self.show_ai_settings(callback)
+                return
+            
+            # Применяем изменения в конфигурации
+            for param, value in changes.items():
+                self.config.update_param(param, value)
+                logger.info(f"Параметр {param} изменен на {value}")
+            
+            # Формируем сообщение об изменениях
+            changes_text = "\n".join([f"• {param}: {value}" for param, value in changes.items()])
+            text = f"✅ Настройки успешно обновлены:\n\n{changes_text}"
+            
+            await callback.message.edit_text(
+                text=text,
+                parse_mode="HTML"
+            )
+            await asyncio.sleep(3)
+            await self.show_ai_settings(callback)
+            
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек AI: {str(e)}")
+            await callback.answer("Ошибка сохранения настроек", show_alert=True)
+
+    async def cancel_ai_edit(self, callback: CallbackQuery) -> None:
+        """Отменяет редактирование настроек AI"""
+        await self.ui.cancel_ai_edit(callback.from_user.id)
+        await self.show_ai_settings(callback)
+        await callback.answer("Редактирование отменено")
+
+    # RSS настройки
+    async def show_rss_settings(self, callback: CallbackQuery):
+        """Показывает настройки RSS"""
         if not self.controller:
             await callback.answer("Контроллер не подключен")
             return
             
         feeds = self.controller.get_rss_status()
-        text = "📡 <b>Настройки RSS-лент</b>\n\n"
-        
-        for feed in feeds:
-            status = "🟢 Активна" if feed['active'] else "🔴 Неактивна"
-            errors = f" | Ошибок: {feed['error_count']}" if feed['error_count'] > 0 else ""
-            text += f"{status} | {feed['url']}{errors}\n"
-        
-        keyboard = await self.ui.back_button()
+        text, keyboard = await self.ui.rss_settings_view(feeds)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    
+    async def start_rss_add(self, callback: CallbackQuery):
+        """Начало добавления RSS"""
+        keyboard = await self.ui.rss_add_dialog()
         await callback.message.edit_text(
-            text=text,
-            reply_markup=keyboard,
-            parse_mode="HTML"
+            "Введите URL новой RSS-ленты:",
+            reply_markup=keyboard
         )
+        # Ожидание ввода реализуется в handle_message
+    
+    async def start_rss_remove(self, callback: CallbackQuery):
+        """Начало удаления RSS"""
+        feeds = self.controller.get_rss_status()
+        keyboard = await self.ui.rss_remove_selector(feeds)
+        await callback.message.edit_text(
+            "Выберите ленту для удаления:",
+            reply_markup=keyboard
+        )
+    
+    async def confirm_rss_remove(self, callback: CallbackQuery):
+        """Подтверждение удаления RSS"""
+        index = int(callback.data.split("_")[-1])
+        feeds = self.controller.get_rss_status()
+        
+        if 0 <= index < len(feeds):
+            removed = self.config.RSS_URLS.pop(index)
+            await callback.answer(f"✅ RSS удалена: {removed}")
+        else:
+            await callback.answer("❌ Неверный индекс")
+        
+        await self.show_rss_settings(callback)
+    
+    async def toggle_rss_feed(self, callback: CallbackQuery):
+        """Включение/выключение RSS-ленты"""
+        try:
+            # Извлечение индекса и действия
+            parts = callback.data.split("_")
+            index = int(parts[2])
+            action = parts[3]
+        except (IndexError, ValueError) as e:
+            logger.error(f"Ошибка парсинга: {callback.data} - {str(e)}")
+            await callback.answer("❌ Ошибка формата команды")
+            return
+        
+        # Логика активации/деактивации
+        success = await self.controller.toggle_rss_feed(index, action == "enable")
+        
+        if success:
+            status = "активирована" if action == "enable" else "деактивирована"
+            await callback.answer(f"✅ Лента {index+1} {status}")
+        else:
+            await callback.answer("❌ Ошибка изменения статуса")
+        
+        await self.show_rss_settings(callback)
+
+    # В обработчик сообщений нужно добавить:
+    async def handle_message(self, message: Message) -> None:
+        """Обработчик текстовых сообщений"""
+        if not await self.is_owner(message):
+            return
+            
+        # Обработка ручного ввода значений
+        if message.reply_to_message:
+            reply_text = message.reply_to_message.text
+            
+            if "температуры" in reply_text:
+                try:
+                    temp = float(message.text)
+                    if 0.1 <= temp <= 1.0:
+                        await self.ui.update_ai_setting(message.from_user.id, "temperature", temp)
+                        await self.show_ai_settings(message, edit_mode=True)
+                        await message.answer(f"✅ Температура установлена: {temp}")
+                    else:
+                        await message.answer("❌ Значение должно быть между 0.1 и 1.0")
+                except ValueError:
+                    await message.answer("❌ Введите число (например: 0.7)")
+                    
+            elif "токенов" in reply_text:
+                try:
+                    tokens = int(message.text)
+                    if 500 <= tokens <= 10000:
+                        await self.ui.update_ai_setting(message.from_user.id, "max_tokens", tokens)
+                        await self.show_ai_settings(message, edit_mode=True)
+                        await message.answer(f"✅ Макс. токенов установлено: {tokens}")
+                    else:
+                        await message.answer("❌ Значение должно быть между 500 и 10000")
+                except ValueError:
+                    await message.answer("❌ Введите целое число (например: 2500)")
+
+    async def show_rss_settings(self, callback: CallbackQuery, edit_mode: bool = False):
+        """Показывает настройки RSS с возможностью редактирования"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+            
+        feeds = self.controller.get_rss_status()
+        text, keyboard = await self.ui.rss_settings_view(feeds, edit_mode)
+        await callback.message.edit_text(text, reply_markup=keyboard)
 
     async def show_notify_settings(self, callback: CallbackQuery) -> None:
         """Показывает настройки уведомлений"""
@@ -491,8 +817,9 @@ class AsyncTelegramBot:
         if new_url in self.config.RSS_URLS:
             await message.answer("⚠️ Эта RSS-лента уже есть в списке")
             return
-        
+    
         self.config.RSS_URLS.append(new_url)
+        self.config.RSS_ACTIVE.append(True)  # Добавляем как активную
         await message.answer(f"✅ RSS-лента добавлена: {new_url}")
 
     async def handle_rss_remove(self, message: Message) -> None:
@@ -508,6 +835,10 @@ class AsyncTelegramBot:
             index = int(args[1]) - 1
             if 0 <= index < len(self.config.RSS_URLS):
                 removed = self.config.RSS_URLS.pop(index)
+                
+                if index < len(self.config.RSS_ACTIVE):
+                    self.config.RSS_ACTIVE.pop(index)
+                
                 await message.answer(f"✅ RSS-лента удалена: {removed}")
             else:
                 await message.answer("❌ Неверный номер RSS-ленты")

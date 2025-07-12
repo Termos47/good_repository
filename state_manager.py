@@ -36,6 +36,7 @@ class StateManager:
         self.backup_dir = Path(self.BACKUP_DIR)
         self._temp_dir = Path(tempfile.gettempdir())
         self._lock_file = self.state_file.with_suffix('.lock')
+        self.editing_state = {}
         
         # Инициализация состояния по умолчанию
         self.state: Dict[str, Any] = {

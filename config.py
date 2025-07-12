@@ -10,9 +10,10 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 import sys
 from dotenv import load_dotenv
 import validators
-import colorama  # Добавлен импорт colorama
+import colorama
 
 load_dotenv()
+colorama.init()
 
 # Инициализация colorama для поддержки цветов в Windows
 colorama.init()
@@ -48,6 +49,12 @@ class StructuredFormatter(logging.Formatter):
         self.debug_mode = debug_mode
         self.use_colors = use_colors
         self._init_colors()
+
+    def add_to_env(self, param: str, value: str):
+        """Добавляет параметр в .env при первом запуске"""
+        if not os.path.exists('.env'):
+            with open('.env', 'w') as f:
+                f.write(f"{param}={value}\n")
 
     def _init_colors(self):
         """Настройка цветовой поддержки"""
@@ -287,7 +294,6 @@ logger = get_logger('ConfigManager')
 
 class Config:
     """Класс для управления конфигурацией приложения"""
-    
     def __init__(self):
         # Инициализация логгера с контекстом
         self.logger = get_logger('Config', {'context_module': 'config'})
@@ -316,7 +322,8 @@ class Config:
         self.RSS_URLS: List[str] = self.validate_rss_urls(rss_urls)
         self.CHECK_INTERVAL: int = self.get_env_var('CHECK_INTERVAL', default=300, var_type=int)
         self.MAX_ENTRIES_HISTORY: int = self.get_env_var('MAX_ENTRIES_HISTORY', default=1000, var_type=int)
-        
+        self.RSS_ACTIVE = [True] * len(self.RSS_URLS)
+
         # Параметры YandexGPT
         self.YANDEX_API_KEY: Optional[str] = self.get_env_var('YANDEX_API_KEY')
         self.YANDEX_FOLDER_ID: str = self.get_env_var('YANDEX_FOLDER_ID', required=True)
@@ -452,7 +459,8 @@ class Config:
             backup_file = '.env.bak'
             shutil.copyfile(env_file, backup_file)
             
-            with open(env_file, 'r') as f:
+            # Читаем файл с правильной кодировкой
+            with open(env_file, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
             
             found = False
@@ -467,7 +475,8 @@ class Config:
             if not found:
                 new_lines.append(f'{param}={value}\n')
             
-            with open(env_file, 'w') as f:
+            # Сохраняем с правильной кодировкой
+            with open(env_file, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
                 
             self.logger.info(f"Updated .env parameter: {param}={value}")
@@ -499,6 +508,13 @@ class Config:
             if validators.url(url):
                 valid_urls.append(url)
         return valid_urls
+    
+    def save_rss_settings(self, urls: List[str], active: List[bool]):
+        """Сохраняет настройки RSS в .env"""
+        self.RSS_URLS = urls
+        self.RSS_ACTIVE = active
+        self.save_to_env_file("RSS_URLS", json.dumps(urls))
+        self.save_to_env_file("RSS_ACTIVE", json.dumps(active))
 
     def get_sanitized_proxy(self) -> Optional[str]:
         """Очищает и проверяет URL прокси"""
@@ -592,6 +608,31 @@ class Config:
             type_name = var_type.__name__ if var_type is not None else 'None'
             logger.error(f"Error converting {name} to {type_name}: {str(e)}")
             return default
+        
+    def update_param(self, param: str, value: Any) -> bool:
+        """Обновляет параметр конфигурации и сохраняет в .env"""
+        if not hasattr(self, param):
+            logger.error(f"Параметр {param} не существует")
+            return False
+            
+        try:
+            # Преобразование типа
+            current_type = type(getattr(self, param))
+            if current_type is bool:
+                converted_value = value.lower() in ['true', '1', 'yes', 'y', 't', 'on'] if isinstance(value, str) else bool(value)
+            else:
+                converted_value = current_type(value)
+            
+            # Установка значения
+            setattr(self, param, converted_value)
+            self.save_to_env_file(param, str(converted_value))
+            logger.info(f"Параметр {param} обновлен на {converted_value}")
+            return True
+            
+        except (TypeError, ValueError) as e:
+            logger.error(f"Ошибка преобразования значения: {str(e)}")
+            return False
+
 # Глобальный экземпляр конфигурации
 app_config: Config = Config()  # Инициализация сразу
 

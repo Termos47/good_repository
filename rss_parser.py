@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor
+from logging import config
 import re
 from urllib.parse import urljoin
 import feedparser
@@ -33,9 +34,18 @@ class AsyncRSSParser:
         self.timeout = aiohttp.ClientTimeout(total=15)
         self.semaphore = asyncio.Semaphore(5)
         self.executor = ProcessPoolExecutor(max_workers=2)
+        self.config = config #===================================================================================================================================
+        self.feed_status = {}  # Словарь для хранения состояния лент
+        self.feed_errors = {}  # Словарь для подсчета ошибок по URL
+
+    def set_feed_status(self, url: str, active: bool):
+        """Устанавливает статус активности для RSS-ленты"""
+        self.feed_status[url] = active
 
     async def fetch_feed(self, url: str) -> Optional[Dict[str, Any]]:
         """Асинхронно загружает и парсит RSS-ленту"""
+        if not self.feed_status.get(url, True):
+            return None
         logger.info(f"Fetching RSS feed: {url}")
         try:
             async with self.session.get(
@@ -53,8 +63,13 @@ class AsyncRSSParser:
                 return await self._safe_parse_feed(content)
 
         except Exception as e:
+            self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
             logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
             return None
+        
+    def get_error_count(self, url: str) -> int:
+        """Возвращает количество ошибок для указанного URL"""
+        return self.feed_errors.get(url, 0)
 
     async def _safe_parse_feed(self, xml_content: Any) -> Optional[Dict[str, Any]]:
         """Безопасный парсинг RSS с защитой от XXE и обработкой ошибок"""
