@@ -1,39 +1,28 @@
-FROM python:3.13-slim
+# Используем официальный образ Python
+FROM python:3.11-slim-bookworm
 
-# Настройка окружения
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1
+# Устанавливаем системные зависимости
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    libjpeg-dev \
+    zlib1g-dev \
+    libfreetype6-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Установка системных зависимостей (с подавлением предупреждений)
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends \
-        apt-utils \
-        libfreetype6-dev \
-        libjpeg-dev \
-        libopenjp2-7-dev \
-        zlib1g-dev > /dev/null 2>&1 && \
-    rm -rf /var/lib/apt/lists/*
-
+# Создаем рабочую директорию
 WORKDIR /app
 
-# Создание и активация виртуального окружения
-RUN python -m venv /opt/venv && \
-    /opt/venv/bin/python -m pip install --no-cache-dir --upgrade pip==25.1.1 && \
-    find /opt/venv -type d -name '__pycache__' -exec rm -rf {} +
-
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Установка зависимостей Python
+# Копируем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir --require-virtualenv -r requirements.txt && \
-    pip check
 
-# Копирование кода
+# Устанавливаем зависимости Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем весь проект
 COPY . .
 
-# Создание рабочих директорий
-RUN mkdir -p logs temp_images templates fonts
+# Создаем необходимые директории
+RUN mkdir -p fonts templates temp_images
 
+# Указываем команду запуска
 CMD ["python", "main.py"]
