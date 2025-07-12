@@ -1,5 +1,6 @@
 import asyncio
 from collections import deque
+import json
 import os
 import logging
 
@@ -194,8 +195,7 @@ class AsyncTelegramBot:
                 await self.set_ai_tokens_custom(callback)
             
             # RSS настройки
-            # RSS настройки
-            elif data == "settings_rss":
+            elif data == "rss_settings":
                 await self.show_rss_settings(callback)
             elif data == "edit_rss_settings":
                 await self.show_rss_settings(callback, edit_mode=True)
@@ -211,7 +211,11 @@ class AsyncTelegramBot:
             elif data.startswith("rss_toggle_"):
                 await self.toggle_rss_feed(callback)
             elif data == "rss_refresh":
-                await self.refresh_rss_status(callback)
+                if hasattr(self, 'refresh_rss_status'):
+                    await self.refresh_rss_status(callback)
+                else:
+                    logger.error("refresh_rss_status method missing")
+                    await callback.answer("Функция недоступна")
 
             else:
                 logger.warning(f"Неизвестный callback: {data}")
@@ -304,18 +308,34 @@ class AsyncTelegramBot:
         await callback.message.edit_text(f"Выберите значение для {param}:", reply_markup=keyboard)
     
     async def set_general_param(self, callback: CallbackQuery):
-        """Установка значения параметра"""
-        _, param, value = callback.data.split("_", 2)
-        param = param.lower()
-        value = float(value) if "." in value else int(value)
+        # Извлекаем данные после префикса "set_general_"
+        data_str = callback.data.replace("set_general_", "", 1)
         
-        await self.ui.update_general_setting(
-            callback.from_user.id,
-            param,
-            value
-        )
-        await self.show_general_settings(callback, edit_mode=True)
-        await callback.answer(f"Значение обновлено: {value}")
+        # Разделяем параметр и значение по первому двоеточию
+        if ":" not in data_str:
+            logger.error(f"Invalid callback data format: {callback.data}")
+            await callback.answer("Ошибка формата данных")
+            return
+            
+        param, value_str = data_str.split(":", 1)
+        
+        try:
+            # Пробуем преобразовать значение в число
+            if "." in value_str:
+                value = float(value_str)
+            else:
+                value = int(value_str)
+                
+            await self.ui.update_general_setting(
+                callback.from_user.id,
+                param,
+                value
+            )
+            await self.show_general_settings(callback, edit_mode=True)
+            await callback.answer(f"Значение обновлено: {value}")
+        except ValueError:
+            logger.error(f"Invalid value for parameter {param}: {value_str}")
+            await callback.answer(f"Недопустимое значение: {value_str}")
     
     async def save_general_settings(self, callback: CallbackQuery):
         """Сохранение изменений"""
@@ -490,16 +510,32 @@ class AsyncTelegramBot:
     
     async def confirm_rss_remove(self, callback: CallbackQuery):
         """Подтверждение удаления RSS"""
-        index = int(callback.data.split("_")[-1])
-        feeds = self.controller.get_rss_status()
-        
-        if 0 <= index < len(feeds):
+        try:
+            index = int(callback.data.split("_")[-1])
+            
+            # Валидация индекса
+            if index < 0 or index >= len(self.config.RSS_URLS):
+                await callback.answer("❌ Неверный индекс ленты")
+                return
+                
             removed = self.config.RSS_URLS.pop(index)
+            
+            # Удаляем соответствующий статус активности
+            if index < len(self.config.RSS_ACTIVE):
+                self.config.RSS_ACTIVE.pop(index)
+            
+            # Сохраняем изменения в контроллере и .env
+            if self.controller:
+                self.controller.update_rss_state(
+                    self.config.RSS_URLS,
+                    self.config.RSS_ACTIVE
+                )
+            
             await callback.answer(f"✅ RSS удалена: {removed}")
-        else:
-            await callback.answer("❌ Неверный индекс")
-        
-        await self.show_rss_settings(callback)
+            await self.show_rss_settings(callback)  # Обновляем интерфейс
+        except (IndexError, ValueError) as e:
+            logger.error(f"Ошибка удаления RSS: {str(e)}")
+            await callback.answer("❌ Ошибка удаления ленты")
     
     async def toggle_rss_feed(self, callback: CallbackQuery):
         """Включение/выключение RSS-ленты"""
@@ -524,13 +560,23 @@ class AsyncTelegramBot:
         
         await self.show_rss_settings(callback)
 
+    async def refresh_rss_status(self, callback: CallbackQuery):
+        """Обновление статуса RSS"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        await self.controller.refresh_rss_status()
+        await callback.answer("Статус RSS обновлен")
+        await self.show_rss_settings(callback)
+
     # В обработчик сообщений нужно добавить:
     async def handle_message(self, message: Message) -> None:
         """Обработчик текстовых сообщений"""
         if not await self.is_owner(message):
             return
-            
-        # Обработка ручного ввода значений
+                
+        # Обработка ручного ввода значений для AI
         if message.reply_to_message:
             reply_text = message.reply_to_message.text
             
@@ -557,6 +603,43 @@ class AsyncTelegramBot:
                         await message.answer("❌ Значение должно быть между 500 и 10000")
                 except ValueError:
                     await message.answer("❌ Введите целое число (например: 2500)")
+                    
+        # Обработка добавления новой RSS-ленты
+        if message.reply_to_message and "Введите URL новой RSS-ленты:" in message.reply_to_message.text:
+            url = message.text.strip()
+            
+            # Проверка валидности URL
+            if not url.startswith(('http://', 'https://')):
+                await message.answer("❌ Некорректный URL. Должен начинаться с http:// или https://")
+                return
+                
+            # Проверка на дубликат
+            if url in self.config.RSS_URLS:
+                await message.answer("⚠️ Эта RSS-лента уже есть в списке")
+                return
+                
+            try:
+                # Добавляем новую ленту
+                self.config.RSS_URLS.append(url)
+                self.config.RSS_ACTIVE.append(True)  # активна по умолчанию
+                
+                # Сохраняем в .env
+                self.config.save_to_env_file("RSS_URLS", json.dumps(self.config.RSS_URLS))
+                self.config.save_to_env_file("RSS_ACTIVE", json.dumps(self.config.RSS_ACTIVE))
+                
+                # Обновляем состояние в контроллере
+                if self.controller:
+                    self.controller.update_rss_state(self.config.RSS_URLS, self.config.RSS_ACTIVE)
+                
+                await message.answer(f"✅ RSS-лента добавлена: {url}")
+                
+                # Показываем обновленные настройки RSS
+                await self.show_rss_settings(message)
+                return
+                
+            except Exception as e:
+                logger.error(f"Ошибка добавления RSS: {str(e)}")
+                await message.answer(f"❌ Ошибка добавления RSS: {str(e)}")
 
     async def show_rss_settings(self, callback: CallbackQuery, edit_mode: bool = False):
         """Показывает настройки RSS с возможностью редактирования"""

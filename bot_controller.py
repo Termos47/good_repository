@@ -729,6 +729,11 @@ class BotController:
             } for i, url in enumerate(self.config.RSS_URLS)
         ]
     
+    async def refresh_rss_status(self):
+        """Обновление статуса RSS лент"""
+        for url in self.config.RSS_URLS:
+            self.rss_parser.refresh_status(url)
+            
     async def show_ai_settings(self, callback: CallbackQuery) -> None:
         """Показывает настройки AI (перенаправляем в Telegram интерфейс)"""
         # Этот метод теперь полностью реализован в Telegram интерфейсе

@@ -9,13 +9,11 @@ import traceback
 from typing import Dict, Any, List, Optional, Tuple, Union
 import sys
 from dotenv import load_dotenv
+from telegram import CallbackQuery
 import validators
 import colorama
 
 load_dotenv()
-colorama.init()
-
-# Инициализация colorama для поддержки цветов в Windows
 colorama.init()
 
 class StructuredFormatter(logging.Formatter):
@@ -516,6 +514,16 @@ class Config:
         self.save_to_env_file("RSS_URLS", json.dumps(urls))
         self.save_to_env_file("RSS_ACTIVE", json.dumps(active))
 
+    async def refresh_rss_status(self, callback: CallbackQuery):
+        """Обновление статуса RSS"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        await self.controller.refresh_rss_status()
+        await callback.answer("Статус RSS обновлен")
+        await self.show_rss_settings(callback)
+
     def get_sanitized_proxy(self) -> Optional[str]:
         """Очищает и проверяет URL прокси"""
         proxy = self.get_env_var('PROXY_URL')
@@ -634,7 +642,8 @@ class Config:
             return False
 
 # Глобальный экземпляр конфигурации
-app_config: Config = Config()  # Инициализация сразу
+if 'app_config' not in globals():
+    app_config = Config()
 
 def get_config() -> Config:
     """Возвращает глобальный экземпляр конфигурации"""

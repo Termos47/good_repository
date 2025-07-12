@@ -522,11 +522,33 @@ class UIBuilder:
     
     async def rss_settings_view(self, feeds: list, edit_mode: bool = False) -> tuple:
         """Интерактивный интерфейс управления RSS-лентами с режимом редактирования"""
+        # Обработка случая, когда нет RSS-лент
+        if not feeds:
+            text = "📡 <b>Нет RSS-лент</b>\n\nИспользуйте кнопку ниже, чтобы добавить новую ленту"
+            builder = InlineKeyboardBuilder()
+            
+            if edit_mode:
+                builder.button(text="➕ Добавить ленту", callback_data="rss_add_start")
+                builder.button(text="◀️ Назад", callback_data="settings")
+                builder.adjust(1)
+            else:
+                builder.button(text="➕ Добавить ленту", callback_data="rss_add_start")
+                builder.button(text="◀️ Назад", callback_data="settings")
+                builder.adjust(1)
+            
+            return text, builder.as_markup()
+        
+        # Режим редактирования
         if edit_mode:
             text = "📡 <b>Редактирование RSS-лент</b>\n\n"
             for i, feed in enumerate(feeds):
                 status = "🟢" if feed.get('active', True) else "🔴"
-                text += f"{i+1}. {status} {feed['url']}\n"
+                error_icon = f" ❗️ {feed.get('error_count', 0)}" if feed.get('error_count', 0) > 0 else ""
+                # Обрезаем длинные URL для отображения
+                url_display = feed['url']
+                if len(url_display) > 50:
+                    url_display = url_display[:25] + "..." + url_display[-25:]
+                text += f"{i+1}. {status} {url_display}{error_icon}\n"
             
             builder = InlineKeyboardBuilder()
             
@@ -547,17 +569,26 @@ class UIBuilder:
             builder.button(text="💾 Сохранить", callback_data="save_rss_settings")
             builder.button(text="❌ Отмена", callback_data="rss_settings")
             
-            builder.adjust(2, 2, 1, 1)  # Группировка кнопок
+            # Группировка кнопок: 2 кнопки на ленту, затем общие кнопки
+            builder.adjust(2, *[2 for _ in range(len(feeds))], 1, 1)
+        # Обычный режим просмотра
         else:
             text = "📡 <b>Текущие RSS-ленты</b>\n\n"
             for i, feed in enumerate(feeds):
                 status = '🟢' if feed.get('active', True) else '🔴'
-                error_icon = f" | ❗️ {feed.get('error_count', 0)}" if feed.get('error_count', 0) > 0 else ""
-                text += f"{i+1}. {status} {feed['url']}{error_icon}\n"
+                error_icon = f" ❗️ {feed.get('error_count', 0)}" if feed.get('error_count', 0) > 0 else ""
+                last_check = f" 📅 {feed.get('last_check', 'никогда')}" if feed.get('last_check') else ""
+                # Обрезаем длинные URL для отображения
+                url_display = feed['url']
+                if len(url_display) > 50:
+                    url_display = url_display[:25] + "..." + url_display[-25:]
+                text += f"{i+1}. {status} {url_display}{error_icon}{last_check}\n"
             
             builder = InlineKeyboardBuilder()
             builder.button(text="✏️ Редактировать", callback_data="edit_rss_settings")
+            builder.button(text="🔄 Обновить статус", callback_data="rss_refresh")
             builder.button(text="◀️ Назад", callback_data="settings")
+            builder.adjust(2, 1)  # Редактировать и Обновить в одной строке, Назад отдельно
         
         return text, builder.as_markup()
     

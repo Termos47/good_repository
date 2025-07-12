@@ -42,6 +42,12 @@ class AsyncRSSParser:
         """Устанавливает статус активности для RSS-ленты"""
         self.feed_status[url] = active
 
+    def refresh_status(self, url: str):
+        """Сброс счетчика ошибок для ленты"""
+        if url in self.feed_errors:
+            del self.feed_errors[url]
+            logger.info(f"RSS status reset for {url}")
+
     async def fetch_feed(self, url: str) -> Optional[Dict[str, Any]]:
         """Асинхронно загружает и парсит RSS-ленту"""
         if not self.feed_status.get(url, True):
