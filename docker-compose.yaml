@@ -1,13 +1,12 @@
-version: "3.8"
 services:
-  rss-bot:
+  telegram-bot:
     build: .
-    container_name: rss-bot
-    restart: always
+    container_name: tg-bot
+    restart: unless-stopped
     env_file:
       - .env
     volumes:
+      - ./data:/app/data
       - ./logs:/app/logs
-      - ./templates:/app/templates
-      - ./bot_state.json:/app/bot_state.json
-      - ./.env:/app/.env  # если нужно явно указать .env
+      - ./state_backups:/app/state_backups
+      - ./temp_images:/app/temp_images
