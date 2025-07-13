@@ -1,5 +1,5 @@
 # Базовый образ
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim
 
 # Установка системных зависимостей для работы с графикой
 RUN apt-get update && apt-get install -y --no-install-recommends \
