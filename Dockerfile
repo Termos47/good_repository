@@ -18,8 +18,8 @@ WORKDIR /app
 COPY requirements.txt .
 COPY *.py ./
 COPY *.json ./
-COPY templates/ ./templates/
-COPY fonts/ ./fonts/
+#COPY templates/ ./templates/
+#COPY fonts/ ./fonts/
 
 # Установка зависимостей
 RUN pip install --no-cache-dir -U pip && \
