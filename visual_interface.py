@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from io import BytesIO
 from datetime import datetime
+import time
 
 logger = logging.getLogger('VisualInterface')
 
@@ -392,6 +393,7 @@ class UIBuilder:
             settings = self.user_editing_states[user_id]
         else:
             settings = {
+                'enabled': self.config.ENABLE_YAGPT,
                 'model': self.config.YAGPT_MODEL,
                 'temperature': self.config.YAGPT_TEMPERATURE,
                 'max_tokens': self.config.YAGPT_MAX_TOKENS
@@ -400,6 +402,7 @@ class UIBuilder:
         theme = self.get_theme(user_id)
         text = (
             "🧠 <b>Настройки YandexGPT</b>\n\n"
+            f"• Состояние: {'🟢 Включен' if settings['enabled'] else '🔴 Выключен'}\n"
             f"• Модель: {settings['model']} {'✏️' if edit_mode else ''}\n"
             f"• Температура: {settings['temperature']} {'✏️' if edit_mode else ''}\n"
             f"• Макс. токенов: {settings['max_tokens']} {'✏️' if edit_mode else ''}"
@@ -412,7 +415,11 @@ class UIBuilder:
             builder.button(text="✏️ Модель", callback_data="edit_ai_model")
             builder.button(text="✏️ Температура", callback_data="edit_ai_temp")
             builder.button(text="✏️ Токены", callback_data="edit_ai_tokens")
-            
+            builder.button(
+                text=f"{'🔴 Выключить' if settings['enabled'] else '🟢 Включить'} ИИ",
+                callback_data="toggle_ai_enabled"
+            )
+
             # Группировка кнопок как в основных настройках
             builder.button(text="💾 Сохранить", callback_data="save_ai_settings")
             builder.button(text="❌ Отмена", callback_data="cancel_ai_edit")
@@ -486,6 +493,7 @@ class UIBuilder:
     async def start_ai_edit(self, user_id: int):
         """Начинает редактирование настроек AI для пользователя"""
         self.user_editing_states[user_id] = {
+            'enabled': self.config.ENABLE_YAGPT,
             'model': self.config.YAGPT_MODEL,
             'temperature': self.config.YAGPT_TEMPERATURE,
             'max_tokens': self.config.YAGPT_MAX_TOKENS
@@ -493,7 +501,10 @@ class UIBuilder:
 
     async def update_ai_setting(self, user_id: int, key: str, value: Any):
         """Обновляет временную настройку"""
-        if user_id in self.user_editing_states:
+        if key == 'enabled':  # Специальная обработка для переключения
+            if user_id in self.user_editing_states:
+                self.user_editing_states[user_id]['enabled'] = not self.user_editing_states[user_id]['enabled']
+        elif user_id in self.user_editing_states:
             self.user_editing_states[user_id][key] = value
 
     async def save_ai_settings(self, user_id: int) -> Dict[str, Any]:
@@ -504,6 +515,9 @@ class UIBuilder:
         changes = {}
         settings = self.user_editing_states.pop(user_id)
         
+        if settings['enabled'] != self.config.ENABLE_YAGPT:
+            changes['ENABLE_YAGPT'] = settings['enabled']
+
         if settings['model'] != self.config.YAGPT_MODEL:
             changes['YAGPT_MODEL'] = settings['model']
         
@@ -536,7 +550,9 @@ class UIBuilder:
                 builder.button(text="◀️ Назад", callback_data="settings")
                 builder.adjust(1)
             
-            return text, builder.as_markup()
+            keyboard = builder.as_markup()
+            keyboard.inline_message_id = f"rss_{int(time.time())}"  # Уникальный ID
+            return text, keyboard
         
         # Режим редактирования
         if edit_mode:
@@ -590,7 +606,9 @@ class UIBuilder:
             builder.button(text="◀️ Назад", callback_data="settings")
             builder.adjust(2, 1)  # Редактировать и Обновить в одной строке, Назад отдельно
         
-        return text, builder.as_markup()
+        keyboard = builder.as_markup()
+        keyboard.inline_message_id = f"rss_{int(time.time())}"  # Уникальный ID
+        return text, keyboard
     
     async def rss_add_dialog(self) -> InlineKeyboardMarkup:
         """Диалог добавления RSS"""

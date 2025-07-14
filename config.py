@@ -310,27 +310,38 @@ class Config:
             self.get_env_var('CHANNEL_ID', required=True)
         )
         self.OWNER_ID: int = self.get_env_var('OWNER_ID', required=True, var_type=int)
-        
-        # Параметры RSS
-        rss_urls = self.get_env_var(
-            'RSS_URLS', 
-            default="https://www.interfax.ru/rss.asp", 
-            var_type=list
-        )
-        self.RSS_URLS: List[str] = self.validate_rss_urls(rss_urls)
+        self.controller = None
+
         self.CHECK_INTERVAL: int = self.get_env_var('CHECK_INTERVAL', default=300, var_type=int)
         self.MAX_ENTRIES_HISTORY: int = self.get_env_var('MAX_ENTRIES_HISTORY', default=1000, var_type=int)
-        self.RSS_ACTIVE = [True] * len(self.RSS_URLS)
+        self.RSS_URLS = self.get_list("RSS_URLS", ['https://www.interfax.ru/rss.asp'])
+        # Проверка обязательных параметров
+        if not self.RSS_URLS:
+            logger.critical("RSS_URLS is required in .env file")
+            raise ValueError("Missing required config: RSS_URLS")
+        self.RSS_ACTIVE = self.get_list(
+            "RSS_ACTIVE", 
+            [True] * len(self.RSS_URLS)
+        )
+
+        # После инициализации RSS_URLS и RSS_ACTIVE добавьте:
+        if len(self.RSS_ACTIVE) != len(self.RSS_URLS):
+            self.logger.warning("RSS_ACTIVE length mismatch, resetting to defaults")
+            self.RSS_ACTIVE = [True] * len(self.RSS_URLS)
 
         # Параметры YandexGPT
         self.YANDEX_API_KEY: Optional[str] = self.get_env_var('YANDEX_API_KEY')
         self.YANDEX_FOLDER_ID: str = self.get_env_var('YANDEX_FOLDER_ID', required=True)
         self.YANDEX_API_ENDPOINT: str = self.get_env_var('YANDEX_API_ENDPOINT', default='https://llm.api.cloud.yandex.net/foundationModels/v1/completion')
-        self.DISABLE_YAGPT: bool = self.get_env_var('DISABLE_YAGPT', default=False, var_type=bool)
+        self.ENABLE_YAGPT: bool = self.get_env_var('ENABLE_YAGPT', default=True, var_type=bool)
         self.YAGPT_MODEL: str = self.get_env_var('YAGPT_MODEL', default='yandexgpt-lite')
         self.YAGPT_TEMPERATURE: float = self.get_env_var('YAGPT_TEMPERATURE', default=0.4, var_type=float)
         self.YAGPT_MAX_TOKENS: int = self.get_env_var('YAGPT_MAX_TOKENS', default=2500, var_type=int)
-        self.YAGPT_PROMPT: str = self.get_env_var('YAGPT_PROMPT', default="")
+        self.YAGPT_PROMPT = self.get_env_var(
+            "YAGPT_PROMPT", 
+            default="Улучши заголовок и описание: '{title}' - '{description}'",
+            var_type=str  # Явно указываем тип строки
+        )
         self.YAGPT_ERROR_THRESHOLD: int = self.get_env_var('YAGPT_ERROR_THRESHOLD', default=5, var_type=int)
         self.AUTO_DISABLE_YAGPT: bool = self.get_env_var('AUTO_DISABLE_YAGPT', default=True, var_type=bool)
         
@@ -641,6 +652,28 @@ class Config:
             logger.error(f"Ошибка преобразования значения: {str(e)}")
             return False
 
+    def get_list(self, key: str, default: list) -> list:
+        value = os.getenv(key)
+        if value is None:
+            return default
+        try:
+            # Приводим строку к нижнему регистру перед парсингом JSON
+            if isinstance(value, str):
+                value_lower = value.lower()
+                # Заменяем True/False на true/false для корректного парсинга JSON
+                value_fixed = re.sub(r'\bTrue\b', 'true', re.sub(r'\bFalse\b', 'false', value_lower))
+                return json.loads(value_fixed)
+            return value
+        except json.JSONDecodeError:
+            # Обработка строки с булевыми значениями через запятую (не JSON)
+            if ',' in value:
+                return [v.strip().lower() == 'true' for v in value.split(',')]
+            # Обработка одиночного значения
+            if value.lower() in ['true', 'false']:
+                return [value.lower() == 'true']
+            logger.error(f"Invalid format for {key}")
+            return default
+
 # Глобальный экземпляр конфигурации
 if 'app_config' not in globals():
     app_config = Config()
@@ -654,3 +687,4 @@ if not _init_done:
     _init_done = True
     # Просто обращаемся к конфигу для инициализации
     _ = app_config
+

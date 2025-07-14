@@ -22,7 +22,10 @@ logger = logging.getLogger('bot.controller')
 class BotController:
     def __init__(self, config, state_manager, rss_parser, image_generator, yandex_gpt, telegram_bot):
         self.config = config
-        self.state_manager = state_manager
+        self.state_manager = StateManager(
+            state_file=config.STATE_FILE,
+            config=config  # Передаем конфиг
+        )
         self.rss_parser = rss_parser
         self.image_generator = image_generator
         self.yandex_gpt = yandex_gpt
@@ -109,6 +112,13 @@ class BotController:
             if not hasattr(self.config, param) or not getattr(self.config, param):
                 raise ValueError(f"Missing required config: {param}")
             
+    def is_available(self) -> bool:
+        """Проверяет, доступен ли сервис Yandex GPT"""
+        return (self.config.YANDEX_API_KEY and 
+                self.config.YANDEX_FOLDER_ID and 
+                self.config.YANDEX_API_ENDPOINT and
+                self.active)
+
     async def start(self) -> bool:
         """Запуск основных процессов бота"""
         if self.is_running:
@@ -265,61 +275,89 @@ class BotController:
         self.stats['min_feed_time'] = min(self.stats['min_feed_time'], cycle_time)
 
     async def _process_single_post(self, post: Union[Dict, str]) -> bool:
+        """Полная обработка одного поста с пропуском при низком качестве"""
         try:
+            # 1. Нормализация поста до стандартного формата
             normalized_post = self._normalize_post(post)
             if not normalized_post:
-                logger.error("Post normalization failed", extra={'post': str(post)[:100]})
+                logger.error("Ошибка нормализации поста: %s", str(post)[:100])
                 return False
 
+            # 2. Генерация уникального ID поста
             post_id = self._generate_post_id(normalized_post)
             normalized_post['post_id'] = post_id
+            logger.debug("Обработка поста ID: %s", post_id)
 
+            # 3. Проверка на дубликаты
             if self._should_skip_post(normalized_post):
-                logger.debug("Skipping duplicate post", extra={'post_id': post_id})
+                logger.info("Пропуск дубликата: %s", normalized_post.get('title', '')[:50])
+                self.stats['duplicates_rejected'] += 1
                 return False
 
+            # 4. Обработка контента (ключевое изменение!)
+            processed_content = await self._process_post_content(normalized_post)
+            
+            # Если обработка вернула None - ПОЛНЫЙ ПРОПУСК ПОСТА
+            if processed_content is None:
+                reason = "Низкое качество контента или обработки ИИ"
+                logger.warning("Пропуск поста из-за низкого качества: %s", normalized_post.get('title', '')[:50])
+                self._log_skipped_post(normalized_post, reason)
+                return False
+
+            # 5. Получение изображения (только если пост не пропущен)
+            image_path = None
             try:
-                processed_content = await self._process_post_content(normalized_post)
-                if not processed_content:
-                    logger.error("Content processing returned empty result")
-                    return False
+                if self.config.IMAGE_SOURCE != 'none':
+                    image_path = await self._get_post_image(normalized_post)
+                    
+                    # Проверка существования файла
+                    if image_path and not os.path.exists(image_path):
+                        logger.warning("Файл изображения не найден: %s", image_path)
+                        image_path = None
             except Exception as e:
-                logger.error("Content processing failed", 
-                            exc_info=True,
-                            extra={'post_id': post_id, 'error': str(e)})
-                return False
-
-            # Добавлены конкретные типы исключений для обработки изображений
-            try:
-                image_path = await self._get_post_image(normalized_post)
-            except aiohttp.ClientError as e:
-                logger.error("Image download failed", extra={'error': str(e)})
-                if self.config.IMAGE_SOURCE == 'none':
-                    image_path = None
-                else:
+                logger.error("Ошибка получения изображения: %s", str(e))
+                if self.config.IMAGE_SOURCE == 'required':
                     return False
-            except PIL.UnidentifiedImageError:
-                logger.error("Invalid image file")
-                return False
-            except OSError as e:
-                logger.error("Filesystem error", extra={'error': str(e)})
-                return False
+                image_path = None
 
+            # 6. Отправка в Telegram
             try:
                 success = await self._send_post_to_telegram(processed_content, normalized_post, image_path)
                 if not success:
+                    logger.error("Ошибка отправки в Telegram: %s", post_id)
+                    # Очистка временного файла изображения
+                    if image_path and os.path.exists(image_path):
+                        try:
+                            os.unlink(image_path)
+                        except OSError as e:
+                            logger.error("Ошибка удаления изображения: %s", str(e))
                     return False
-                    
-                self._update_stats_after_post(normalized_post)
-                return True
             except Exception as e:
-                logger.error("Post sending failed", exc_info=True)
+                logger.critical("Критическая ошибка отправки: %s", str(e), exc_info=True)
                 if image_path and os.path.exists(image_path):
                     try:
                         os.unlink(image_path)
-                    except OSError as e:
-                        logger.error("Failed to delete temp image", extra={'error': str(e)})
+                    except OSError:
+                        pass
                 return False
+
+            # 7. Успешная обработка - обновление статистики
+            self._update_stats_after_post(normalized_post)
+            logger.info("Пост успешно обработан: %s", normalized_post.get('title', '')[:50])
+            
+            # Очистка временного изображения после отправки
+            if image_path and os.path.exists(image_path):
+                try:
+                    os.unlink(image_path)
+                except OSError as e:
+                    logger.warning("Не удалось удалить временное изображение: %s", str(e))
+            
+            return True
+
+        except Exception as e:
+            logger.critical("Критическая ошибка обработки поста: %s", str(e), exc_info=True)
+            return False
+
         except Exception as e:
             logger.critical("Unexpected error in post processing", exc_info=True)
             return False
@@ -358,44 +396,122 @@ class BotController:
             
         return False
     
-    async def _process_post_content(self, post: Dict) -> Dict[str, str]:
-        """Обработка текста поста с возможным использованием AI"""
-        if self.config.DISABLE_YAGPT or not self.yandex_gpt.active:
-            return {
-                'title': post.get('title', '')[:self.config.MAX_TITLE_LENGTH],
-                'description': post.get('description', '')[:self.config.MAX_DESC_LENGTH]
-            }
-            
+    async def _process_post_content(self, post: Dict) -> Optional[Dict[str, str]]:
+        """Обработка контента с жёсткой фильтрацией ИИ-результатов"""
         try:
-            result = await self.yandex_gpt.enhance(
-                post.get('title', ''),
-                post.get('description', '')
+            title = post.get('title', '')
+            description = post.get('description', '')
+            
+            # Если контент слишком короткий - сразу пропускаем пост
+            if len(title) < 5 or len(description) < 20:
+                logger.warning("Слишком короткий контент, пропуск поста")
+                return None
+
+            # Проверяем условия для использования ИИ
+            use_ai = (
+                self.config.ENABLE_YAGPT and
+                self.yandex_gpt and
+                self.yandex_gpt.active and
+                self.yandex_gpt.is_available()
             )
-            
-            if not result:
+
+            # Если ИИ отключен - используем оригинальный контент
+            if not use_ai:
                 return {
-                    'title': post.get('title', '')[:self.config.MAX_TITLE_LENGTH],
-                    'description': post.get('description', '')[:self.config.MAX_DESC_LENGTH]
+                    'title': self._truncate_text(title, self.config.MAX_TITLE_LENGTH),
+                    'description': self._truncate_text(description, self.config.MAX_DESC_LENGTH)
                 }
-                
-            self.stats['yagpt_used'] += 1
-            return {
-                'title': result.get('title', post.get('title', ''))[:self.config.MAX_TITLE_LENGTH],
-                'description': result.get('description', post.get('description', ''))[:self.config.MAX_DESC_LENGTH]
-            }
-        except Exception as e:
-            logger.error("AI content enhancement failed: %s", str(e), exc_info=True)
-            self.stats['yagpt_errors'] += 1
+
+            # Вызов ИИ для улучшения контента
+            logger.debug(f"Обработка через YandexGPT: {title[:50]}...")
+            result = await self.yandex_gpt.enhance(title, description)
             
-            # Автоматическое отключение YandexGPT при превышении лимита ошибок
-            if self.config.AUTO_DISABLE_YAGPT and self.stats['yagpt_errors'] >= self.config.YAGPT_ERROR_THRESHOLD:
-                self.yandex_gpt.active = False
-                logger.warning("YandexGPT disabled due to error threshold")
+            # Если ИИ вернул None (плохой ответ) - пропускаем пост
+            if result is None:
+                logger.warning("ИИ вернул некачественный результат, пропуск поста")
+                return None
                 
-            return {
-                'title': post.get('title', '')[:self.config.MAX_TITLE_LENGTH],
-                'description': post.get('description', '')[:self.config.MAX_DESC_LENGTH]
+            # Формируем обработанный контент
+            processed_content = {
+                'title': self._truncate_text(result.get('title', title), self.config.MAX_TITLE_LENGTH),
+                'description': self._truncate_text(result.get('description', description), self.config.MAX_DESC_LENGTH)
             }
+            
+            # Жёсткая проверка на SEO-мусор
+            if self._contains_low_quality_phrases(processed_content):
+                logger.warning("Обнаружен SEO-мусор в результате ИИ, пропуск поста")
+                return None
+                
+            return processed_content
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки контента: {str(e)}", exc_info=True)
+            return None  # Пропускаем пост при ошибках
+        
+    def _contains_low_quality_phrases(self, content: Dict) -> bool:
+        """Определяет, содержит ли контент SEO-мусор"""
+        # Ключевые фразы для пропуска
+        skip_phrases = [
+            "в интернете есть много сайтов",
+            "посмотрите, что нашлось в поиске",
+            "дополнительные материалы:",
+            "смотрите также:",
+            "читайте далее",
+            "читайте также",
+            "рекомендуем прочитать",
+            "подробнее на сайте",
+            "другие источники:",
+            "больше информации можно найти",
+            "в поиске найдены"
+        ]
+        
+        # Объединяем заголовок и описание
+        full_text = f"{content['title']} {content['description']}".lower()
+        
+        # Проверяем наличие запрещённых фраз
+        for phrase in skip_phrases:
+            if phrase in full_text:
+                return True
+                
+        # Проверяем на Markdown-ссылки
+        if re.search(r'\[.*\]\(https?://[^\)]+\)', full_text):
+            return True
+            
+        return False
+
+    def _log_skipped_post(self, post: Dict, reason: str):
+        """Логирует информацию о пропущенном посте"""
+        log_data = {
+            'timestamp': datetime.now().isoformat(),
+            'original_title': post.get('title'),
+            'original_description': post.get('description'),
+            'link': post.get('link'),
+            'reason': reason,
+            'post_id': post.get('post_id', '')
+        }
+        
+        try:
+            # Создаём директорию для логов если её нет
+            os.makedirs('logs', exist_ok=True)
+            
+            # Записываем в JSON Lines формат
+            with open('logs/skipped_posts.json', 'a', encoding='utf-8') as f:
+                f.write(json.dumps(log_data, ensure_ascii=False) + '\n')
+        except Exception as e:
+            logger.error(f"Ошибка логирования пропущенного поста: {str(e)}")
+
+    @staticmethod
+    def _truncate_text(text: str, max_length: int) -> str:
+        """Обрезает текст до указанной длины с учетом слов"""
+        if len(text) <= max_length:
+            return text
+            
+        # Ищем последний пробел перед максимальной длиной
+        truncated = text[:max_length]
+        if last_space := truncated.rfind(' '):
+            truncated = truncated[:last_space]
+            
+        return truncated + '...'
 
     async def _get_post_image(self, post: Dict) -> Optional[str]:
         # Режим none - без изображений
@@ -589,32 +705,99 @@ class BotController:
                 pass
             return None
 
+    def _remove_formatting(self, text: str) -> str:
+        """
+        Удаляет Markdown, HTML и служебные префиксы из текста
+        :param text: Исходный текст
+        :return: Очищенный текст
+        """
+        if not text:
+            return ""
+        
+        # Удаление Markdown-разметки (**текст**, __текст__)
+        text = re.sub(r'\*\*|\_\_', '', text)
+        
+        # Удаление HTML-тегов
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Удаление служебных префиксов
+        text = re.sub(
+            r'^(\s*[#\*\s]*(Заголовок|Title|Заг|Описание|Description|Опц|Desc)[\s:\-\—]*\s*[#\*\s]*)', 
+            '', 
+            text, 
+            flags=re.IGNORECASE
+        )
+        
+        # Удаление ведущих символов пунктуации
+        text = re.sub(r'^[\s\:\-\—\#\*]+', '', text)
+        
+        # Удаление двойных пробелов
+        text = re.sub(r'\s{2,}', ' ', text)
+        
+        return text.strip()
+
     async def _send_post_to_telegram(self, content: Dict, post: Dict, image_path: Optional[str]) -> bool:
-        """Отправка поста в Telegram канал с использованием правильного метода"""
+        """Отправка поста в Telegram канал с очисткой форматирования"""
         try:
-            message_text = f"<b>{content['title']}</b>\n\n{content['description']}\n\n<a href='{post.get('link', '')}'>Читать далее</a>"
+            logger.debug(f"Original title: {content.get('title', '')}")
+            logger.debug(f"Original description: {content.get('description', '')}")
+            # Функция для очистки текста от форматирования
+            def clean_text(text: str) -> str:
+                """Удаляет Markdown, HTML и служебные префиксы из текста"""
+                if not text:
+                    return ""
+                
+                # Удаление Markdown-разметки (**текст**, __текст__)
+                text = re.sub(r'\*\*|\_\_', '', text)
+                
+                # Удаление HTML-тегов
+                text = re.sub(r'<[^>]+>', '', text)
+                
+                # Удаление служебных префиксов (Заголовок:, Описание: и т.д.)
+                text = re.sub(
+                    r'^(\s*[#\*\s]*(Заголовок|Title|Заг|Описание|Description|Опц|Desc)[\s:\-\—]*\s*[#\*\s]*)', 
+                    '', 
+                    text, 
+                    flags=re.IGNORECASE
+                )
+                
+                # Удаление ведущих символов пунктуации
+                text = re.sub(r'^[\s\:\-\—\#\*]+', '', text)
+                
+                # Удаление двойных пробелов
+                text = re.sub(r'\s{2,}', ' ', text)
+                
+                return text.strip()
+
+            # Очищаем заголовок и описание
+            title = clean_text(content.get('title', ''))
+            description = clean_text(content.get('description', ''))
             
+            # Форматирование сообщения
+            message_text = f"<b>{title}</b>\n\n{description}\n\n<a href='{post.get('link', '')}'>Читать далее</a>"
+            logger.debug(f"Cleaned title: {title}")
+            logger.debug(f"Cleaned description: {description}")
+            # Отправка поста с изображением или без
             if image_path and os.path.exists(image_path):
-                # Используем метод send_post вместо send_photo
                 success = await self.telegram_bot.send_post(
-                    title=content['title'],
-                    description=content['description'],
+                    title=title,
+                    description=description,
                     link=post.get('link', ''),
                     image_path=image_path
                 )
             else:
                 success = await self.telegram_bot.send_post(
-                    title=content['title'],
-                    description=content['description'],
+                    title=title,
+                    description=description,
                     link=post.get('link', ''),
                     image_path=None
                 )
                 
             if success:
-                logger.info(f"Post sent successfully: {content['title'][:50]}...")
+                logger.info(f"Post sent successfully: {title[:50]}...")
                 return True
             else:
-                logger.error(f"Failed to send post: {content['title'][:50]}...")
+                logger.error(f"Failed to send post: {title[:50]}...")
                 return False
                 
         except Exception as e:
@@ -718,21 +901,52 @@ class BotController:
         """Возвращает текущее состояние RSS"""
         
         return self.config.RSS_URLS, self.config.RSS_ACTIVE
+    
+    async def refresh_rss_status(self) -> bool:
+        """Обновление статуса RSS лент. Возвращает True если были изменения"""
+        changed = False
+        
+        # Если у парсера есть метод refresh_status
+        if hasattr(self.rss_parser, 'refresh_status'):
+            for url in self.config.RSS_URLS:
+                if self.rss_parser.refresh_status(url):
+                    changed = True
+        
+        # Если у парсера есть метод get_last_check
+        if hasattr(self.rss_parser, 'get_last_check'):
+            for url in self.config.RSS_URLS:
+                last_check = self.rss_parser.get_last_check(url)
+                if last_check:
+                    # Проверяем, было ли обновление с момента последней проверки
+                    if not self.stats.get(f'last_rss_check_{url}') or last_check > self.stats[f'last_rss_check_{url}']:
+                        self.stats[f'last_rss_check_{url}'] = last_check
+                        changed = True
+        
+        return changed
+    
     def get_rss_status(self) -> List[Dict]:
         """Возвращает статус с учетом активности"""
-        return [
-            {
+        status_list = []
+        
+        for i, url in enumerate(self.config.RSS_URLS):
+            status = {
                 'url': url,
                 'active': self.config.RSS_ACTIVE[i],
-                'error_count': self.rss_parser.get_error_count(url),
-                'last_check': self.rss_parser.get_last_check(url) if hasattr(self.rss_parser, 'get_last_check') else None
-            } for i, url in enumerate(self.config.RSS_URLS)
-        ]
-    
-    async def refresh_rss_status(self):
-        """Обновление статуса RSS лент"""
-        for url in self.config.RSS_URLS:
-            self.rss_parser.refresh_status(url)
+                'error_count': 0,
+                'last_check': None
+            }
+            
+            # Получаем количество ошибок
+            if hasattr(self.rss_parser, 'get_error_count'):
+                status['error_count'] = self.rss_parser.get_error_count(url)
+            
+            # Получаем время последней проверки
+            if hasattr(self.rss_parser, 'get_last_check'):
+                status['last_check'] = self.rss_parser.get_last_check(url)
+            
+            status_list.append(status)
+        
+        return status_list
             
     async def show_ai_settings(self, callback: CallbackQuery) -> None:
         """Показывает настройки AI (перенаправляем в Telegram интерфейс)"""

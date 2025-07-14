@@ -9,6 +9,7 @@ import re
 from collections import OrderedDict
 from pathlib import Path
 import tempfile
+from config import Config
 
 logger = logging.getLogger('StateManager')
 
@@ -30,13 +31,14 @@ class StateManager:
     DEFAULT_MAX_ENTRIES = 1000
     BACKUP_DIR = "state_backups"
     
-    def __init__(self, state_file: str = 'bot_state.json', max_entries: int = DEFAULT_MAX_ENTRIES):
+    def __init__(self, state_file: str = 'bot_state.json', max_entries: int = DEFAULT_MAX_ENTRIES, config: Config = None):
         self.state_file = Path(state_file)
         self.max_entries = max_entries
         self.backup_dir = Path(self.BACKUP_DIR)
         self._temp_dir = Path(tempfile.gettempdir())
         self._lock_file = self.state_file.with_suffix('.lock')
         self.editing_state = {}
+        self.config = config
         
         # Инициализация состояния по умолчанию
         self.state: Dict[str, Any] = {
@@ -242,6 +244,7 @@ class StateManager:
             # Обновляем метаданные
             self.state['metadata'].update({
                 'last_modified': self._current_timestamp(),
+                'enable_yagpt': self.config.ENABLE_YAGPT,
                 'entries_count': len(self.state['sent_entries']),
                 'hashes_count': len(self.state['sent_hashes'])
             })

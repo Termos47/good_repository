@@ -19,6 +19,9 @@ from bot_controller import BotController
 from visual_interface import UIBuilder
 from aiogram.types import BufferedInputFile
 from aiogram.types import Message as TelegramMessage
+from aiogram.exceptions import TelegramBadRequest
+import time
+
 
 logger = logging.getLogger('AsyncTelegramBot')
 
@@ -183,6 +186,8 @@ class AsyncTelegramBot:
                 await self.cancel_ai_edit(callback)
             elif data.startswith("edit_ai_"):  # edit_ai_model, edit_ai_temp, edit_ai_tokens
                 await self.edit_ai_param(callback)
+            elif data == "toggle_ai_enabled":
+                await self.toggle_ai_enabled(callback)
             elif data.startswith("set_ai_model:"):
                 await self.set_ai_model(callback)
             elif data.startswith("set_ai_temp:"):
@@ -407,6 +412,12 @@ class AsyncTelegramBot:
         await self.show_ai_settings(callback, edit_mode=True)
         await callback.answer(f"Модель изменена на {model}")
 
+    async def toggle_ai_enabled(self, callback: CallbackQuery) -> None:
+        """Переключает состояние ИИ"""
+        await self.ui.update_ai_setting(callback.from_user.id, "enabled", None)
+        await self.show_ai_settings(callback, edit_mode=True)
+        await callback.answer("Состояние ИИ изменено")
+
     async def set_ai_temp(self, callback: CallbackQuery) -> None:
         """Устанавливает температуру из предустановленных значений"""
         temp = float(callback.data.split(":")[1])
@@ -566,9 +577,12 @@ class AsyncTelegramBot:
             await callback.answer("Контроллер не подключен")
             return
         
-        await self.controller.refresh_rss_status()
-        await callback.answer("Статус RSS обновлен")
-        await self.show_rss_settings(callback)
+        changed = await self.controller.refresh_rss_status()
+        if changed:
+            await callback.answer("Статус RSS обновлен")
+            await self.show_rss_settings(callback)
+        else:
+            await callback.answer("Данные не изменились")
 
     # В обработчик сообщений нужно добавить:
     async def handle_message(self, message: Message) -> None:
@@ -649,7 +663,23 @@ class AsyncTelegramBot:
             
         feeds = self.controller.get_rss_status()
         text, keyboard = await self.ui.rss_settings_view(feeds, edit_mode)
-        await callback.message.edit_text(text, reply_markup=keyboard)
+        
+        try:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=keyboard
+            )
+        except TelegramBadRequest as e:
+            if "message is not modified" in str(e):
+                logger.debug("Skipping unchanged RSS status")
+            else:
+                raise
+        except Exception:
+            await self.bot.send_message(
+                chat_id=callback.message.chat.id,
+                text=text,
+                reply_markup=keyboard
+            )
 
     async def show_notify_settings(self, callback: CallbackQuery) -> None:
         """Показывает настройки уведомлений"""
@@ -815,14 +845,14 @@ class AsyncTelegramBot:
         )
         await message.answer(stats, parse_mode="HTML")
 
-    async def handle_rss_list(self, callback: CallbackQuery) -> None:
-        """Отправляет список RSS-лент как ответ на callback"""
-        if not await self.enforce_owner_access(callback):
+    async def handle_rss_list(self, message: Message) -> None:  # Изменён тип параметра
+        """Отправляет список RSS-лент"""
+        if not await self.enforce_owner_access(message):
             return
             
         try:
             if not self.controller:
-                await callback.answer("⚠️ Контроллер не подключен")
+                await message.answer("⚠️ Контроллер не подключен")
                 return
                 
             feeds = self.controller.get_rss_status()
@@ -834,25 +864,19 @@ class AsyncTelegramBot:
                 last_check = f" | 📅 {feed.get('last_check', 'никогда')}" if feed.get('last_check') else ""
                 lines.append(f"{i}. {status_icon} {feed['url'][:50]}...{error_icon}{last_check}")
             
-            # Создаем клавиатуру с кнопкой "Назад"
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")]
             ])
             
-            # Отправляем сообщение
-            await callback.message.answer(
+            await message.answer(  # Используем message вместо callback
                 text="\n".join(lines),
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
-            await callback.answer()
         except Exception as e:
             logger.error(f"Error showing RSS list: {str(e)}")
-            await callback.answer("Ошибка получения списка лент", show_alert=True)
+            await message.answer("Ошибка получения списка лент")
             
-    async def is_owner(self, message: Message) -> bool:
-        return message.from_user and message.from_user.id == self.config.OWNER_ID
-
     async def enforce_owner_access(self, message_or_callback: Union[Message, CallbackQuery]) -> bool:
         """Проверяет доступ и уведомляет о попытках несанкционированного доступа"""
         user_id = message_or_callback.from_user.id
@@ -886,6 +910,9 @@ class AsyncTelegramBot:
             pass
         
         return False
+    
+    async def is_owner(self, message: Message) -> bool:
+        return message.from_user.id == self.config.OWNER_ID
 
     async def handle_rss_add(self, message: Message) -> None:
         if not await self.is_owner(message):
@@ -968,7 +995,7 @@ class AsyncTelegramBot:
         
         settings = (
             "⚙️ <b>Текущие настройки:</b>\n"
-            f"YandexGPT: {'🟢 Вкл' if not self.config.DISABLE_YAGPT else '🔴 Выкл'}\n"
+            f"YandexGPT: {'🟢 Вкл' if self.config.ENABLE_YAGPT else '🔴 Выкл'}\n"
             f"Изображения: {'🟢 Вкл' if self.config.ENABLE_IMAGE_GENERATION else '🔴 Выкл'}\n"
             f"Источник изображений: {source_mapping.get(self.config.IMAGE_SOURCE, 'Неизвестно')}\n"
             f"Резервная генерация: {'🟢 Вкл' if self.config.IMAGE_FALLBACK else '🔴 Выкл'}\n"

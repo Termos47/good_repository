@@ -6,6 +6,7 @@ import signal
 import aiohttp
 import traceback
 import platform
+from dotenv import load_dotenv
 from config import app_config as config
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -14,16 +15,18 @@ from aiogram.exceptions import TelegramAPIError
 from config import Config
 from datetime import datetime
 from bot_controller import BotController
+from pathlib import Path
 from state_manager import StateManager
 from rss_parser import AsyncRSSParser
 from image_generator import AsyncImageGenerator
 from yandex_gpt import AsyncYandexGPT
 from telegram_interface import AsyncTelegramBot
 from visual_interface import UIBuilder
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Union
 from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 logger = logging.getLogger('AsyncMain')
+load_dotenv()
 
 async def shutdown(loop, controller):
     """Корректное завершение работы"""
@@ -146,8 +149,8 @@ async def run_bot():
         @telegram_bot.dp.message()
         async def global_blocker(message: Message):
             if message.from_user.id != config.OWNER_ID:
-                await telegram_bot.enforce_owner_access(message)
-            return
+                await message.answer("⛔ Доступ запрещен")
+                return
         
         # Установка меню команд
         await telegram_bot.setup_commands()
@@ -188,8 +191,8 @@ async def run_bot():
         
         # Обработчик ошибок
         @dp.errors()
-        async def errors_handler(event: Update, exception: Exception):
-            logger.error(f"Update {event.update_id} caused error: {exception}", exc_info=True)
+        async def errors_handler(event: ErrorEvent):
+            logger.error(f"Update {event.update} caused error: {event.exception}")
             return True
         
         # Запуск обработки команд Telegram

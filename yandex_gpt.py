@@ -4,7 +4,6 @@ import re
 import time
 import aiohttp
 import asyncio
-from functools import lru_cache
 from typing import Dict, Optional
 import html
 
@@ -14,30 +13,39 @@ class AsyncYandexGPT:
     def __init__(self, config, session: aiohttp.ClientSession):
         self.config = config
         self.session = session
-        self.active = bool(config.YANDEX_API_KEY) and not config.DISABLE_YAGPT
+        self.active = bool(config.YANDEX_API_KEY) and config.ENABLE_YAGPT
+        
+        # Инициализация статистики
+        self.stats = {
+            'yagpt_used': 0,
+            'yagpt_errors': 0,
+            'token_usage': 0
+        }
+        
+        # Остальной код без изменений
         self.error_count = 0
         self.last_error_time = None
+        self.token_usage = 0
+        self.rate_limit_remaining = float('inf')
+        self.rate_limit_reset = 0
         
-        # Добавлено для управления квотами
-        self.rate_limit_remaining = 100  # Начальное значение
-        self.rate_limit_reset = 0  # Время сброса квоты
-        self.token_usage = 0  # Текущее использование токенов
-    
+        self.headers = {
+            "Authorization": f"Api-Key {config.YANDEX_API_KEY}",
+            "x-folder-id": self.config.YANDEX_FOLDER_ID,
+            "Content-Type": "application/json"
+        }
+        logger.info(f"YandexGPT initialized. Active: {self.active}")
+
+    def is_available(self) -> bool:
+        """Проверяет, доступен ли сервис в текущий момент"""
+        return self.active and self.error_count < self.config.YAGPT_ERROR_THRESHOLD
+
     def _sanitize_prompt_input(self, text: str) -> str:
-        """
-        Экранирует специальные символы и предотвращает инъекции в промпт.
-        Args:
-            text: Входной текст для обработки
-        Returns:
-            Безопасный текст, готовый к использованию в промпте
-        """
+        """Экранирует специальные символы и предотвращает инъекции в промпт"""
         if not isinstance(text, str):
             return ""
         
-        # Экранирование HTML/XML
         sanitized = html.escape(text)
-        
-        # Замена специальных символов
         replacements = {
             '{': '{{',
             '}': '}}',
@@ -55,123 +63,146 @@ class AsyncYandexGPT:
         for char, replacement in replacements.items():
             sanitized = sanitized.replace(char, replacement)
         
-        # Удаление управляющих символов
         sanitized = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', sanitized)
-        
-        # Ограничение длины
         return sanitized[:5000]
 
     async def enhance(self, title: str, description: str) -> Optional[Dict]:
-        # Проверка возможности восстановления после ошибки
-        if not self.active and self.config.AUTO_DISABLE_YAGPT:
-            if self.last_error_time and time.time() - self.last_error_time > 600:
-                self.active = True
-                self.error_count = 0
-                logger.info("Re-enabling YandexGPT after cooldown period")
-            else:
-                return None
-        
-        # Проверка квоты токенов
-        if self.token_usage > self.config.YAGPT_MAX_TOKENS * 0.9:
-            logger.warning("Token usage limit approached, skipping YandexGPT")
+        """
+        Улучшает заголовок и описание с помощью Yandex GPT
+        Возвращает словарь с улучшенными title и description или None при ошибке
+        """
+        if not self.active or not self.is_available():
             return None
-            
-        # Проверка rate limiting
-        current_time = time.time()
-        if current_time < self.rate_limit_reset:
-            wait_time = self.rate_limit_reset - current_time
-            logger.warning(f"Rate limit exceeded, waiting {wait_time:.1f}s")
-            await asyncio.sleep(wait_time + 1)
-        
-        # Экранирование пользовательского ввода
-        safe_title = self._sanitize_prompt_input(title)
-        safe_description = self._sanitize_prompt_input(description)
-        
-        logger.debug(f"Sending to YandexGPT. Title: {safe_title[:50]}..., Desc: {safe_description[:50]}...")
-        
+
         try:
-            headers = {
-                "Authorization": f"Api-Key {self.config.YANDEX_API_KEY}",
-                "x-folder-id": self.config.YANDEX_FOLDER_ID,
-                "Content-Type": "application/json"
-            }
+            # Подсчет токенов (простая оценка)
+            tokens = len(title.split()) + len(description.split())
             
-            payload = {
-                "modelUri": f"gpt://{self.config.YANDEX_FOLDER_ID}/{self.config.YAGPT_MODEL}/latest",
+            # Проверка на превышение лимита токенов
+            if tokens > self.config.YAGPT_MAX_TOKENS * 0.9:  # Оставляем 10% запаса
+                logger.warning(f"Content too long: {tokens}/{self.config.YAGPT_MAX_TOKENS} tokens")
+                return None
+
+            # Формирование промпта
+            prompt = self.config.YAGPT_PROMPT.format(
+                title=title,
+                description=description
+            )
+
+            # Подготовка данных для запроса
+            request_data = {
+                "modelUri": f"gpt://{self.config.YANDEX_FOLDER_ID}/{self.config.YAGPT_MODEL}",
                 "completionOptions": {
+                    "stream": False,
                     "temperature": self.config.YAGPT_TEMPERATURE,
                     "maxTokens": self.config.YAGPT_MAX_TOKENS
                 },
                 "messages": [
                     {
                         "role": "user",
-                        "text": self.config.YAGPT_PROMPT.format(title=safe_title, description=safe_description)
+                        "text": prompt
                     }
                 ]
             }
-            
+
+            # Отправка запроса
             async with self.session.post(
                 self.config.YANDEX_API_ENDPOINT,
-                headers=headers,
-                json=payload,
+                headers={
+                    "Authorization": f"Api-Key {self.config.YANDEX_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=request_data,
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
                 
-                # Обработка заголовков rate limiting
-                if 'X-RateLimit-Remaining' in response.headers:
-                    self.rate_limit_remaining = int(
-                        response.headers['X-RateLimit-Remaining']
-                    )
-                if 'X-RateLimit-Reset' in response.headers:
-                    self.rate_limit_reset = int(
-                        response.headers['X-RateLimit-Reset']
-                    )
+                if response.status != 200:
+                    error = await response.text()
+                    logger.error(f"Yandex GPT API error: {response.status} - {error}")
+                    return None
+
+                data = await response.json()
+                result_text = data.get('result', {}).get('alternatives', [{}])[0].get('message', {}).get('text', '')
                 
-                if response.status == 429:  # Too Many Requests
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    logger.warning(f"Rate limited, retrying after {retry_after}s")
-                    await asyncio.sleep(retry_after)
-                    return await self.enhance(title, description)  # Рекурсивный повтор
+                # Логирование сырого ответа для отладки
+                logger.debug(f"Raw Yandex GPT response: {result_text[:200]}...")
+
+                # Парсинг результата с помощью специализированного метода
+                parsed_response = self.parse_response({
+                    'result': {
+                        'alternatives': [{
+                            'message': {'text': result_text}
+                        }]
+                    }
+                })
                 
-                if response.status == 200:
-                    data = await response.json()
-                    logger.debug(f"YandexGPT response: {data}")
+                if parsed_response:
+                    return parsed_response
+                
+                # Fallback: обработка вручную если автоматический парсинг не сработал
+                logger.warning("Falling back to manual response parsing")
+                
+                # Удаление служебных префиксов
+                cleaned_text = re.sub(
+                    r'^(Заголовок|Описание|Title|Description)[:\s]*', 
+                    '', 
+                    result_text, 
+                    flags=re.IGNORECASE | re.MULTILINE
+                )
+                
+                # Разделение на строки
+                lines = [line.strip() for line in cleaned_text.split('\n') if line.strip()]
+                
+                # Обработка случая пустого ответа
+                if not lines:
+                    return None
                     
-                    # Обновляем использование токенов
-                    if 'usage' in data.get('result', {}):
-                        self.token_usage += data['result']['usage']['totalTokens']
-                        logger.info(f"Token usage updated: {self.token_usage}/{self.config.YAGPT_MAX_TOKENS}")
-                    
-                    result = self.parse_response(data)
-                    
-                    if result:
-                        logger.debug(f"YandexGPT processing successful")
-                        return result
-                    else:
-                        logger.warning("Failed to parse YandexGPT response")
-                        raise ValueError("Failed to parse YandexGPT response")
-                else:
-                    error_text = await response.text()
-                    logger.error(f"YandexGPT API error. Status: {response.status}, Response: {error_text}")
-                    self.error_count += 1
-                    self.last_error_time = time.time()
-                    
+                # Извлечение заголовка (первая непустая строка)
+                enhanced_title = lines[0]
+                
+                # Извлечение описания (все остальные строки)
+                enhanced_description = '\n'.join(lines[1:]) if len(lines) > 1 else description
+
+                # Обрезаем до максимальной длины
+                enhanced_title = enhanced_title[:self.config.MAX_TITLE_LENGTH]
+                enhanced_description = enhanced_description[:self.config.MAX_DESC_LENGTH]
+
+                # Обновление статистики
+                self.stats['yagpt_used'] += 1
+                
+                return {
+                    'title': enhanced_title,
+                    'description': enhanced_description
+                }
+
         except asyncio.TimeoutError:
-            logger.error("YandexGPT request timed out")
-            self.error_count += 1
-            self.last_error_time = time.time()
+            logger.error("Yandex GPT request timeout")
+            return None
         except Exception as e:
-            logger.error(f"YandexGPT error: {str(e)}")
-            self.error_count += 1
-            self.last_error_time = time.time()
-        
-        # Проверяем порог ошибок для отключения
-        if (self.config.AUTO_DISABLE_YAGPT and 
-            self.error_count >= self.config.YAGPT_ERROR_THRESHOLD):
-            logger.warning(f"Disabling YandexGPT after {self.error_count} errors")
-            self.active = False
+            logger.error(f"Yandex GPT enhancement error: {str(e)}", exc_info=True)
+            return None
+
+    def is_low_quality_response(self, text: str) -> bool:
+        """Определяет низкокачественный ответ ИИ"""
+        if not text:
+            return True
             
-        return None
+        quality_indicators = [
+            "в интернете есть много сайтов",
+            "посмотрите, что нашлось в поиске",
+            "дополнительные материалы:",
+            "смотрите также:",
+            "читайте далее",
+            "читайте также",
+            "рекомендуем прочитать",
+            "подробнее на сайте",
+            "другие источники:",
+            "больше информации можно найти",
+            r"\[.*\]\(https?://[^\)]+\)"  # Markdown ссылки
+        ]
+        
+        text_lower = text.lower()
+        return any(re.search(phrase, text_lower) for phrase in quality_indicators)
 
     def parse_response(self, data: Dict) -> Optional[Dict]:
         try:
@@ -181,7 +212,7 @@ class AsyncYandexGPT:
                 
             text = data['result']['alternatives'][0]['message']['text']
             
-            # Попытка извлечь JSON
+            # Попытка прямого JSON парсинга
             try:
                 start_idx = text.find('{')
                 end_idx = text.rfind('}')
@@ -193,7 +224,7 @@ class AsyncYandexGPT:
                             'title': self._sanitize_text(result['title']),
                             'description': self._sanitize_text(result['description'])
                         }
-            except (ValueError, json.JSONDecodeError, AttributeError) as e:
+            except (ValueError, json.JSONDecodeError, AttributeError):
                 pass
             
             # Расширенные шаблоны для извлечения данных
@@ -212,7 +243,6 @@ class AsyncYandexGPT:
             for pattern in patterns:
                 match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
                 if match:
-                    # Определяем группу с заголовком
                     for i in range(1, min(3, len(match.groups()) + 1)):
                         if match.group(i) and len(match.group(i).strip()) > 5:
                             title_match = match.group(i).strip()
@@ -225,7 +255,6 @@ class AsyncYandexGPT:
                 for pattern in patterns:
                     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
                     if match and len(match.groups()) > 1:
-                        # Ищем следующую группу после заголовка
                         for i in range(2, min(4, len(match.groups()) + 1)):
                             if match.group(i) and len(match.group(i).strip()) > 10:
                                 desc_match = match.group(i).strip()
@@ -233,14 +262,13 @@ class AsyncYandexGPT:
                         if desc_match:
                             break
             
-            # Fallback: если не нашли структурированные данные
+            # Fallback стратегии
             if not title_match or not desc_match:
                 parts = re.split(r'\n\n|\n-|\n•', text, maxsplit=1)
                 if len(parts) >= 2:
                     title_match = parts[0].strip()
                     desc_match = parts[1].strip()
                 else:
-                    # Последняя попытка - первые 2 предложения
                     sentences = re.split(r'[.!?]\s+', text)
                     if len(sentences) > 1:
                         title_match = sentences[0]
@@ -263,11 +291,7 @@ class AsyncYandexGPT:
         """Sanitizes text for Telegram HTML parsing"""
         if not text:
             return ""
-        
-        # Удаляем непечатные символы
         sanitized = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', str(text))
-        
-        # Заменяем проблемные символы
         return (
             sanitized
             .replace('&', '&amp;')
