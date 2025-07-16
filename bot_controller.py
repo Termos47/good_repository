@@ -202,11 +202,11 @@ class BotController:
                 cycle_time = time.time() - cycle_start
                 self._update_processing_stats(cycle_time)
                 
-                # Периодическое сохранение состояния
+                # Сохранение состояния каждые 5 минут
                 if time.time() - last_save_time > 300:
                     self.state.save_state()
                     last_save_time = time.time()
-                
+                    
                 await asyncio.sleep(self.config.CHECK_INTERVAL)
                 
             except asyncio.CancelledError:
@@ -217,44 +217,149 @@ class BotController:
                 await asyncio.sleep(min(60, self.config.CHECK_INTERVAL * 2))
 
     async def _fetch_all_feeds(self) -> List[Dict]:
-        """Загрузка и парсинг всех RSS-лент"""
+        """Загрузка RSS-лент с детализированным логированием"""
         new_posts = []
+        if not self.is_running:
+            return new_posts
+            
+        logger.info("⏳ Начало загрузки RSS-лент")
+        active_feeds = 0
+        total_new = 0
         
-        for url in self.config.RSS_URLS:
+        for i, url in enumerate(self.config.RSS_URLS):
             try:
                 if not self.is_running:
                     break
                     
-                logger.debug("Fetching feed: %s", url)
+                # Пропуск неактивных лент
+                if not self.config.RSS_ACTIVE[i]:
+                    logger.debug("⏭ Лента отключена: %s", url)
+                    continue
+                    
+                logger.debug("📥 Загрузка ленты: %s", url)
+                start_time = time.time()
                 feed_content = await self.rss_parser.fetch_feed(url)
-                if feed_content:
-                    entries = self.rss_parser.parse_entries(feed_content)
-                    normalized_entries = [
-                        e if isinstance(e, dict) else {'link': e, 'title': ''}
-                        for e in entries if isinstance(e, (dict, str))
-                    ]
-                    new_posts.extend(normalized_entries)
+                
+                if not feed_content:
+                    logger.info("🚫 Лента пуста: %s", url)
+                    continue
+                    
+                # Парсинг записей
+                entries = self.rss_parser.parse_entries(feed_content)
+                if not entries:
+                    logger.info("🔍 Нет новых записей в ленте: %s", url)
+                    continue
+                    
+                # Нормализация и фильтрация
+                valid_entries = []
+                for entry in entries:
+                    if isinstance(entry, dict) and entry.get('link'):
+                        valid_entries.append(entry)
+                    elif isinstance(entry, str) and entry.strip():
+                        valid_entries.append({'link': entry, 'source': url})
+                
+                if not valid_entries:
+                    logger.info("🔍 Нет валидных записей в ленте: %s", url)
+                    continue
+                    
+                new_posts.extend(valid_entries)
+                active_feeds += 1
+                elapsed = time.time() - start_time
+                logger.info("✅ Добавлено %d записей из %s (%.2f сек)", 
+                            len(valid_entries), urlparse(url).netloc, elapsed)
+                    
             except Exception as e:
-                logger.error("Error processing feed %s: %s", url, str(e), exc_info=True)
+                logger.error("⚠️ Ошибка обработки ленты %s: %s", url, str(e))
                 self.stats['errors'] += 1
                 
+        total_new = len(new_posts)
+        if total_new == 0:
+            logger.info("🔍 Все ленты обработаны, новых постов не найдено")
+        else:
+            logger.info("📥 Всего загружено %d новых постов из %d лент", total_new, active_feeds)
+        
         return new_posts
 
     async def _process_new_posts(self, posts: List[Dict]):
-        """Обработка новых постов с учетом ограничений"""
-        for post in posts[:self.config.MAX_POSTS_PER_CYCLE]:
+        """Обработка новых постов с улучшенным логированием"""
+        if not posts:
+            logger.info("🔍 Нет новых постов для обработки")
+            return
+            
+        # Убрать ограничение на количество обрабатываемых постов
+        max_to_process = len(posts)  # Обрабатываем ВСЕ посты
+        
+        duplicate_count = 0
+        processed_count = 0
+        skipped_count = 0
+        start_time = time.time()
+        
+        logger.info(f"🔄 Начало обработки {max_to_process} новых постов")
+        
+        # Временный кеш для быстрой проверки дубликатов
+        duplicate_cache = set()
+        
+        for i, post in enumerate(posts[:max_to_process]):
             if not self.is_running:
                 break
                 
             try:
-                # Соблюдение минимального интервала между постами
+                # Быстрая нормализация
+                temp_post = self._quick_normalize(post)
+                if not temp_post:
+                    skipped_count += 1
+                    continue
+                    
+                # Генерация ID
+                post_id = self._generate_post_id(temp_post)
+                
+                # Проверка дубликата
+                if self.state.is_entry_sent(post_id):
+                    duplicate_count += 1
+                    duplicate_cache.add(post_id)
+                    continue
+                    
+                # Задержка между постами
                 await self._enforce_post_delay()
                 
-                # Полная обработка поста
-                await self._process_single_post(post)
+                # Обработка поста
+                if await self._process_single_post(post):
+                    processed_count += 1
+                else:
+                    skipped_count += 1
+                    
             except Exception as e:
-                logger.error("Error processing post: %s", str(e), exc_info=True)
-                self.stats['errors'] += 1
+                logger.error("⚠️ Ошибка обработки поста: %s", str(e))
+                skipped_count += 1
+        
+        # Итоговая статистика
+        elapsed = time.time() - start_time
+        total_skipped = duplicate_count + skipped_count
+        
+        logger.info("📊 Итоги обработки (%.2f сек):", elapsed)
+        logger.info("   ✅ Успешно обработано: %d", processed_count)
+        logger.info("   ⏭ Пропущено дубликатов: %d", duplicate_count)
+        
+        if skipped_count > 0:
+            logger.info("   ⚠️ Пропущено по другим причинам: %d", skipped_count)
+        
+        logger.info("   🔄 Всего пропущено: %d", total_skipped)
+        
+        # Обновление статистики
+        self.stats['duplicates_rejected'] += duplicate_count
+        self.stats['posts_processed'] = self.stats.get('posts_processed', 0) + processed_count
+        self.stats['posts_skipped'] = self.stats.get('posts_skipped', 0) + total_skipped
+
+    def _quick_normalize(self, post: Union[Dict, str]) -> Optional[Dict]:
+        """Быстрая нормализация только для проверки дубликатов"""
+        if isinstance(post, dict) and post.get('link'):
+            return {
+                'link': post['link'],
+                'title': post.get('title', '')
+            }
+        elif isinstance(post, str) and post:
+            return {'link': post, 'title': ''}
+        return None
 
     async def _enforce_post_delay(self):
         """Обеспечение минимальной задержки между постами"""
@@ -275,95 +380,68 @@ class BotController:
         self.stats['min_feed_time'] = min(self.stats['min_feed_time'], cycle_time)
 
     async def _process_single_post(self, post: Union[Dict, str]) -> bool:
-        """Полная обработка одного поста с пропуском при низком качестве"""
+        """Оптимизированная обработка поста"""
+        image_path = None
         try:
-            # 1. Нормализация поста до стандартного формата
+            # 1. Нормализация поста
             normalized_post = self._normalize_post(post)
             if not normalized_post:
-                logger.error("Ошибка нормализации поста: %s", str(post)[:100])
                 return False
 
-            # 2. Генерация уникального ID поста
+            # 2. Генерация ID
             post_id = self._generate_post_id(normalized_post)
             normalized_post['post_id'] = post_id
-            logger.debug("Обработка поста ID: %s", post_id)
+            original_title = normalized_post.get('title', '')[:50]
+            logger.debug("🆔 Обработка поста: %s", original_title)
 
-            # 3. Проверка на дубликаты
-            if self._should_skip_post(normalized_post):
-                logger.info("Пропуск дубликата: %s", normalized_post.get('title', '')[:50])
-                self.stats['duplicates_rejected'] += 1
-                return False
-
-            # 4. Обработка контента (ключевое изменение!)
+            # 3. Обработка контента
             processed_content = await self._process_post_content(normalized_post)
-            
-            # Если обработка вернула None - ПОЛНЫЙ ПРОПУСК ПОСТА
             if processed_content is None:
-                reason = "Низкое качество контента или обработки ИИ"
-                logger.warning("Пропуск поста из-за низкого качества: %s", normalized_post.get('title', '')[:50])
-                self._log_skipped_post(normalized_post, reason)
                 return False
 
-            # 5. Получение изображения (только если пост не пропущен)
-            image_path = None
-            try:
-                if self.config.IMAGE_SOURCE != 'none':
+            # 4. Получение изображения
+            if self.config.IMAGE_SOURCE != 'none':
+                try:
                     image_path = await self._get_post_image(normalized_post)
-                    
-                    # Проверка существования файла
-                    if image_path and not os.path.exists(image_path):
-                        logger.warning("Файл изображения не найден: %s", image_path)
-                        image_path = None
-            except Exception as e:
-                logger.error("Ошибка получения изображения: %s", str(e))
-                if self.config.IMAGE_SOURCE == 'required':
-                    return False
-                image_path = None
+                    if not image_path and self.config.IMAGE_SOURCE == 'required':
+                        return False
+                except Exception:
+                    if self.config.IMAGE_SOURCE == 'required':
+                        return False
 
-            # 6. Отправка в Telegram
-            try:
-                success = await self._send_post_to_telegram(processed_content, normalized_post, image_path)
-                if not success:
-                    logger.error("Ошибка отправки в Telegram: %s", post_id)
-                    # Очистка временного файла изображения
-                    if image_path and os.path.exists(image_path):
-                        try:
-                            os.unlink(image_path)
-                        except OSError as e:
-                            logger.error("Ошибка удаления изображения: %s", str(e))
-                    return False
-            except Exception as e:
-                logger.critical("Критическая ошибка отправки: %s", str(e), exc_info=True)
-                if image_path and os.path.exists(image_path):
-                    try:
-                        os.unlink(image_path)
-                    except OSError:
-                        pass
-                return False
-
-            # 7. Успешная обработка - обновление статистики
-            self._update_stats_after_post(normalized_post)
-            logger.info("Пост успешно обработан: %s", normalized_post.get('title', '')[:50])
+            # 5. Отправка в Telegram
+            processed_title = processed_content.get('title', '')[:50]
+            success = await self._send_post_to_telegram(
+                processed_content, 
+                normalized_post, 
+                image_path
+            )
             
-            # Очистка временного изображения после отправки
+            if success:
+                self._update_stats_after_post(normalized_post)
+                logger.info("✅ Пост отправлен: %s", processed_title)
+                return True
+            return False
+
+        except Exception as e:
+            logger.error("⚠️ Ошибка обработки: %s", str(e))
+            return False
+            
+        finally:
+            # Очистка временных файлов
             if image_path and os.path.exists(image_path):
                 try:
                     os.unlink(image_path)
-                except OSError as e:
-                    logger.warning("Не удалось удалить временное изображение: %s", str(e))
-            
-            return True
+                except OSError:
+                    pass
 
-        except Exception as e:
-            logger.critical("Критическая ошибка обработки поста: %s", str(e), exc_info=True)
-            return False
-
-        except Exception as e:
-            logger.critical("Unexpected error in post processing", exc_info=True)
-            return False
+    def _generate_content_hash(self, post: Dict) -> str:
+        """Генерация MD5 хеша контента поста"""
+        content = f"{post.get('title', '')}{post.get('description', '')}"
+        return hashlib.md5(content.encode('utf-8')).hexdigest()
 
     def _normalize_post(self, post: Union[Dict, str]) -> Dict:
-        """Гарантированно возвращает Dict с минимально необходимыми полями"""
+        """Нормализация поста в стандартный формат"""
         if isinstance(post, str):
             return {
                 'link': post,
@@ -372,26 +450,53 @@ class BotController:
                 'pub_date': datetime.now().isoformat()
             }
         if isinstance(post, dict):
-            # Обеспечиваем наличие обязательных полей
+            # Убедимся, что все необходимые поля присутствуют
             post.setdefault('link', '')
             post.setdefault('title', '')
             post.setdefault('description', '')
             post.setdefault('pub_date', datetime.now().isoformat())
             return post
-        raise ValueError(f"Invalid post type: {type(post)}")
+        logger.error("Неподдерживаемый тип поста: %s", type(post))
+        return None
 
     def _generate_post_id(self, post: Dict) -> str:
+        """Генерация уникального ID на основе стабильных данных"""
         stable_data = f"{post.get('link', '')}{post.get('title', '')}"
         return hashlib.md5(stable_data.encode()).hexdigest()
 
+    async def _enforce_post_delay(self):
+        """Соблюдение минимальной задержки между постами"""
+        time_since_last = time.time() - self.last_post_time
+        if time_since_last < self.config.MIN_DELAY_BETWEEN_POSTS:
+            delay = self.config.MIN_DELAY_BETWEEN_POSTS - time_since_last
+            logger.debug("⏳ Ожидание %.1f сек перед следующим постом", delay)
+            await asyncio.sleep(delay)
+
+    def _update_stats_after_post(self, post: Dict):
+        """Обновление статистики после успешной отправки"""
+        self.state.add_sent_entry(post)
+        self.stats['posts_sent'] += 1
+        self.stats['last_post'] = datetime.now()
+        self.last_post_time = time.time()
+        
+        # Обновление почасовой статистики
+        hour = datetime.now().hour
+        self.hourly_stats[f"hour_{hour}"] = self.hourly_stats.get(f"hour_{hour}", 0) + 1
+        logger.debug("📊 Статистика обновлена: +1 пост")
+
     def _should_skip_post(self, post: Dict) -> bool:
+        """Проверка на дубликат без индивидуального логирования"""
         post_id = post.get('post_id', '')
         if not post_id:
-            return False
+            return True
             
+        # Проверка дубликата по ID
         if self.state.is_entry_sent(post_id):
-            logger.debug("Skipping duplicate post: %s", post.get('title', '')[:50])
-            self.stats['duplicates_rejected'] += 1
+            return True
+            
+        # Проверка дубликата по хешу контента
+        content_hash = self._generate_content_hash(post)
+        if content_hash and self.state.is_hash_sent(content_hash):
             return True
             
         return False
@@ -814,13 +919,6 @@ class BotController:
         # Обновление почасовой статистики
         hour = datetime.now().hour
         self.hourly_stats[f"hour_{hour}"] = self.hourly_stats.get(f"hour_{hour}", 0) + 1
-        
-        # Принудительное сохранение после первого поста
-        try:
-            self.state.save_state()
-            self.logger.info("State saved after first post")
-        except Exception as e:
-            self.logger.error(f"Failed to save state: {str(e)}")
 
     async def _cleanup_loop(self):
         """Регулярная очистка устаревших данных"""

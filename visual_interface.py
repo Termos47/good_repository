@@ -386,6 +386,18 @@ class UIBuilder:
         
         return changes
     
+    async def cancel_general_edit(self, user_id: int) -> None:
+        """Сбрасывает состояние редактирования общих настроек"""
+        if user_id in self.general_edit_states:
+            del self.general_edit_states[user_id]
+        logger.debug(f"Сброшено состояние редактирования для {user_id}")
+    
+    async def cancel_ai_edit(self, user_id: int) -> None:
+        """Сбрасывает состояние редактирования AI настроек"""
+        if user_id in self.ai_edit_states:
+            del self.ai_edit_states[user_id]
+        logger.debug(f"Сброшено состояние AI редактирования для {user_id}")
+
     async def ai_settings_view(self, user_id: int, edit_mode: bool = False) -> tuple:
         """Возвращает текст и клавиатуру для настроек AI"""
         # Получаем текущие или временные настройки

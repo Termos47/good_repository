@@ -22,19 +22,27 @@ class AsyncYandexGPT:
             'token_usage': 0
         }
         
-        # Остальной код без изменений
+        # Счетчики ошибок для автоотключения
         self.error_count = 0
-        self.last_error_time = None
-        self.token_usage = 0
-        self.rate_limit_remaining = float('inf')
-        self.rate_limit_reset = 0
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 3  # Максимум ошибок перед автоотключением
+        
+        # Маппинг моделей на их URI
+        self.MODEL_URIS = {
+            'yandexgpt-lite': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
+            'yandexgpt': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt/latest",
+            'yandexgpt-pro': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-pro/latest",
+            'yandexgpt-lite:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
+            'yandexgpt:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt/latest",
+            'yandexgpt-pro:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-pro/latest",
+        }
         
         self.headers = {
             "Authorization": f"Api-Key {config.YANDEX_API_KEY}",
             "x-folder-id": self.config.YANDEX_FOLDER_ID,
             "Content-Type": "application/json"
         }
-        logger.info(f"YandexGPT initialized. Active: {self.active}")
+        logger.info(f"YandexGPT initialized. Active: {self.active}, Model: {config.YAGPT_MODEL}")
 
     def is_available(self) -> bool:
         """Проверяет, доступен ли сервис в текущий момент"""

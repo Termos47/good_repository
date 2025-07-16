@@ -324,6 +324,17 @@ class Config:
             [True] * len(self.RSS_URLS)
         )
 
+        # После инициализации RSS_URLS и RSS_ACTIVE
+        if len(self.RSS_ACTIVE) != len(self.RSS_URLS):
+            self.logger.warning(
+                f"RSS_ACTIVE length mismatch ({len(self.RSS_ACTIVE)} != {len(self.RSS_URLS)}), "
+                "resetting to defaults"
+            )
+            self.RSS_ACTIVE = [True] * len(self.RSS_URLS)
+            
+            # Автоматическое исправление в .env
+            self.save_to_env_file("RSS_ACTIVE", json.dumps(self.RSS_ACTIVE))
+
         # После инициализации RSS_URLS и RSS_ACTIVE добавьте:
         if len(self.RSS_ACTIVE) != len(self.RSS_URLS):
             self.logger.warning("RSS_ACTIVE length mismatch, resetting to defaults")
@@ -656,22 +667,29 @@ class Config:
         value = os.getenv(key)
         if value is None:
             return default
+        
         try:
-            # Приводим строку к нижнему регистру перед парсингом JSON
-            if isinstance(value, str):
-                value_lower = value.lower()
-                # Заменяем True/False на true/false для корректного парсинга JSON
-                value_fixed = re.sub(r'\bTrue\b', 'true', re.sub(r'\bFalse\b', 'false', value_lower))
-                return json.loads(value_fixed)
-            return value
+            # Удаляем внешние кавычки если они есть
+            cleaned_value = value.strip().strip('"').strip("'")
+            
+            # Обработка случая с одиночным значением
+            if cleaned_value.lower() in ['true', 'false']:
+                return [cleaned_value.lower() == 'true']
+                
+            # Парсим JSON
+            parsed = json.loads(cleaned_value)
+            
+            # Гарантируем что это список
+            if isinstance(parsed, list):
+                return parsed
+            
+            # Если это не список - конвертируем
+            return [parsed]
+            
         except json.JSONDecodeError:
-            # Обработка строки с булевыми значениями через запятую (не JSON)
+            # Fallback: обработка через запятые
             if ',' in value:
                 return [v.strip().lower() == 'true' for v in value.split(',')]
-            # Обработка одиночного значения
-            if value.lower() in ['true', 'false']:
-                return [value.lower() == 'true']
-            logger.error(f"Invalid format for {key}")
             return default
 
 # Глобальный экземпляр конфигурации

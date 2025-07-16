@@ -3,6 +3,7 @@ from collections import deque
 import json
 import os
 import logging
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from state_manager import StateManager
@@ -20,10 +21,84 @@ from visual_interface import UIBuilder
 from aiogram.types import BufferedInputFile
 from aiogram.types import Message as TelegramMessage
 from aiogram.exceptions import TelegramBadRequest
-import time
 
 
 logger = logging.getLogger('AsyncTelegramBot')
+
+class InputValidator:
+    """Класс для валидации вводимых пользователем значений"""
+    @staticmethod
+    def validate_temperature(text: str) -> float:
+        """Валидация температуры ИИ (0.1-1.0)"""
+        if not text.replace('.', '', 1).isdigit():
+            raise ValueError("Требуется числовое значение")
+            
+        value = float(text)
+        if value < 0.1 or value > 1.0:
+            raise ValueError("Допустимый диапазон: 0.1-1.0")
+            
+        return round(value, 1)  # Округление до 1 знака
+
+    @staticmethod
+    def validate_tokens(text: str) -> int:
+        """Валидация количества токенов (500-10000)"""
+        try:
+            # Поддержка экспоненциальной записи (1e3)
+            value = float(text)
+            value = int(value)
+        except ValueError:
+            raise ValueError("Требуется целое число")
+        
+        if value < 500 or value > 10000:
+            raise ValueError("Допустимый диапазон: 500-10000")
+            
+        return value
+
+    @staticmethod
+    def validate_interval(text: str) -> int:
+        """Валидация интервалов времени с поддержкой единиц измерения"""
+        multipliers = {'s': 1, 'm': 60, 'h': 3600}
+        unit = text[-1].lower() if text else ''
+        
+        try:
+            if unit in multipliers:
+                num = float(text[:-1])
+                value = num * multipliers[unit]
+            else:
+                value = float(text)
+                
+            # Ограничения: 60 сек - 24 часа
+            value = max(60, min(86400, value))
+            return int(value)
+        except ValueError:
+            raise ValueError("Формат: число[ед] (например: 5m, 300, 0.5h)")
+
+    @staticmethod
+    def validate_boolean(text: str) -> bool:
+        """Валидация булевых значений"""
+        true_values = ['true', '1', 'yes', 'y', 'on', 'вкл', 'да']
+        false_values = ['false', '0', 'no', 'n', 'off', 'выкл', 'нет']
+        
+        clean_text = text.strip().lower()
+        if clean_text in true_values:
+            return True
+        if clean_text in false_values:
+            return False
+            
+        raise ValueError("Используйте: да/нет, вкл/выкл, true/false")
+
+    @staticmethod
+    def validate_integer(text: str, min_val: int, max_val: int) -> int:
+        """Общая валидация целых чисел"""
+        try:
+            value = int(text)
+        except ValueError:
+            raise ValueError("Требуется целое число")
+            
+        if value < min_val or value > max_val:
+            raise ValueError(f"Допустимый диапазон: {min_val}-{max_val}")
+            
+        return value
 
 class AsyncTelegramBot:
     def __init__(self, token: str, channel_id: str, config: Config):
@@ -34,6 +109,13 @@ class AsyncTelegramBot:
         self.dp = Dispatcher()
         self.controller: Optional[BotController] = None
         self.ui = UIBuilder(config)
+        self.pending_input = {}  # user_id: {'param': param_name, 'type': 'general'}
+        self.pending_input_timeouts = {}
+        self.pending_input_retries = {}
+        self.validator = InputValidator()
+
+        # Запуск фоновой задачи очистки
+        self.cleanup_task = asyncio.create_task(self._cleanup_pending_inputs())
         
         self._register_handlers()
     
@@ -112,6 +194,7 @@ class AsyncTelegramBot:
         self.dp.message.register(self.handle_params_list, Command("params_list"))
         self.dp.message.register(self.handle_param_info, Command("param_info"))
         self.dp.message.register(self.handle_set_all, Command("set_all"))
+        self.dp.message.register(self.handle_message)
         
         self.dp.callback_query.register(self.handle_callback)
     
@@ -221,6 +304,12 @@ class AsyncTelegramBot:
                 else:
                     logger.error("refresh_rss_status method missing")
                     await callback.answer("Функция недоступна")
+            
+            # Обработка повторного ввода и отмены
+            elif data.startswith("retry_"):
+                await self.handle_retry_input(callback)
+            elif data.startswith("cancel_edit_"):
+                await self.handle_cancel_edit(callback)
 
             else:
                 logger.warning(f"Неизвестный callback: {data}")
@@ -230,6 +319,32 @@ class AsyncTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка обработки callback: {str(e)}", exc_info=True)
             await callback.answer("Ошибка обработки запроса")
+
+    async def _cleanup_pending_inputs(self):
+        """Очистка просроченных ожиданий ввода"""
+        while True:
+            current_time = time.time()
+            expired_users = [
+                user_id for user_id, timeout in self.pending_input_timeouts.items()
+                if timeout < current_time
+            ]
+            
+            for user_id in expired_users:
+                if user_id in self.pending_input:
+                    try:
+                        await self.bot.send_message(
+                            chat_id=self.pending_input[user_id]['chat_id'],
+                            text="⏱️ Время ввода истекло. Операция отменена."
+                        )
+                    except:
+                        pass
+                    del self.pending_input[user_id]
+                if user_id in self.pending_input_timeouts:
+                    del self.pending_input_timeouts[user_id]
+                if user_id in self.pending_input_retries:
+                    del self.pending_input_retries[user_id]
+            
+            await asyncio.sleep(60)  # Проверка каждую минуту
 
     async def show_monitoring(self, callback: CallbackQuery) -> None:
         """Показывает панель мониторинга"""
@@ -271,35 +386,41 @@ class AsyncTelegramBot:
             parse_mode="HTML"
         )
 
-    async def show_ai_settings(self, callback: CallbackQuery, edit_mode: bool = False) -> None:
-        """Показывает настройки AI"""
-        text, keyboard = await self.ui.ai_settings_view(callback.from_user.id, edit_mode)
+    async def show_ai_settings(self, target: Union[Message, CallbackQuery], edit_mode: bool = False) -> None:
+        """Универсальный метод для отображения настроек AI"""
+        user_id = target.from_user.id
+        text, keyboard = await self.ui.ai_settings_view(user_id, edit_mode)
         
-        try:
-            await callback.message.edit_text(
-                text=text,
-                reply_markup=keyboard,
-                parse_mode="HTML"
-            )
-        except Exception:
-            await self.bot.send_message(
-                chat_id=callback.message.chat.id,
+        if isinstance(target, CallbackQuery):
+            try:
+                await target.message.edit_text(
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await self.bot.send_message(
+                    chat_id=target.message.chat.id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+        else:  # Это объект Message
+            await target.answer(
                 text=text,
                 reply_markup=keyboard,
                 parse_mode="HTML"
             )
 
-    async def show_general_settings(self, callback: CallbackQuery, edit_mode: bool = False):
-        """Показывает основные настройки"""
-        if not self.controller:
-            await callback.answer("Контроллер не подключен")
-            return
-            
-        text, keyboard = await self.ui.general_settings_view(
-            callback.from_user.id, 
-            edit_mode
-        )
-        await callback.message.edit_text(text, reply_markup=keyboard)
+    async def show_general_settings(self, target: Union[Message, CallbackQuery], edit_mode: bool = False) -> None:
+        """Универсальный метод для отображения общих настроек"""
+        user_id = target.from_user.id
+        text, keyboard = await self.ui.general_settings_view(user_id, edit_mode)
+        
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, reply_markup=keyboard)
+        else:  # Это объект Message
+            await target.answer(text, reply_markup=keyboard)
     
     async def edit_general_settings(self, callback: CallbackQuery):
         """Вход в режим редактирования"""
@@ -312,11 +433,47 @@ class AsyncTelegramBot:
         keyboard = await self.ui.general_param_selector(callback.from_user.id, param)
         await callback.message.edit_text(f"Выберите значение для {param}:", reply_markup=keyboard)
     
-    async def set_general_param(self, callback: CallbackQuery):
+    async def set_general_param(self, callback: CallbackQuery) -> None:
+        """Обработчик установки значений для основных настроек"""
         # Извлекаем данные после префикса "set_general_"
         data_str = callback.data.replace("set_general_", "", 1)
+        user_id = callback.from_user.id
         
-        # Разделяем параметр и значение по первому двоеточию
+        # Обработка ручного ввода (кнопка "Вручную")
+        if data_str.endswith("_custom"):
+            param = data_str.replace("_custom", "")
+            
+            # Сохраняем информацию о параметре
+            self.pending_input[user_id] = {
+                'param': param,
+                'type': 'general',
+                'chat_id': callback.message.chat.id,
+            }
+            
+            # Устанавливаем таймаут 5 минут
+            self.pending_input_timeouts[user_id] = time.time() + 300
+            
+            # Отправляем запрос с примерами
+            examples = {
+                'temperature': "0.1-1.0 (например: 0.7)",
+                'max_tokens': "500-10000 (например: 2500)",
+                'check_interval': "60-86400 сек (например: 300 или 5m)",
+                'min_delay_between_posts': "10-3600 сек (например: 60)",
+                'posts_per_hour': "1-100 (например: 10)"
+            }.get(param, "числовое значение")
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_general")]
+            ])
+            
+            await callback.message.answer(
+                f"✏️ Введите новое значение для параметра '{param}':\n(Формат: {examples})",
+                reply_markup=keyboard
+            )
+            await callback.answer()
+            return
+        
+        # Обработка предустановленных значений (обычный выбор)
         if ":" not in data_str:
             logger.error(f"Invalid callback data format: {callback.data}")
             await callback.answer("Ошибка формата данных")
@@ -325,22 +482,22 @@ class AsyncTelegramBot:
         param, value_str = data_str.split(":", 1)
         
         try:
-            # Пробуем преобразовать значение в число
-            if "." in value_str:
-                value = float(value_str)
-            else:
-                value = int(value_str)
-                
+            # Преобразуем значение в число (целое или дробное)
+            value = float(value_str) if "." in value_str else int(value_str)
+            
+            # Обновляем временное значение в UI
             await self.ui.update_general_setting(
                 callback.from_user.id,
                 param,
                 value
             )
+            
+            # Обновляем сообщение с настройками
             await self.show_general_settings(callback, edit_mode=True)
-            await callback.answer(f"Значение обновлено: {value}")
+            await callback.answer(f"✅ Значение обновлено: {value}")
         except ValueError:
             logger.error(f"Invalid value for parameter {param}: {value_str}")
-            await callback.answer(f"Недопустимое значение: {value_str}")
+            await callback.answer(f"❌ Недопустимое значение: {value_str}")
     
     async def save_general_settings(self, callback: CallbackQuery):
         """Сохранение изменений"""
@@ -365,6 +522,51 @@ class AsyncTelegramBot:
         except Exception as e:
             logger.error(f"Ошибка сохранения: {str(e)}")
             await callback.answer("Ошибка сохранения настроек", show_alert=True)
+
+    async def cancel_general_edit(self, callback: CallbackQuery) -> None:
+        """Отменяет редактирование общих настроек"""
+        try:
+            user_id = callback.from_user.id
+            
+            # Сбрасываем состояние редактирования в UI
+            if hasattr(self.ui, 'cancel_general_edit'):
+                await self.ui.cancel_general_edit(user_id)
+            
+            # Очищаем состояние ожидания ввода
+            if user_id in self.pending_input:
+                del self.pending_input[user_id]
+            if user_id in self.pending_input_timeouts:
+                del self.pending_input_timeouts[user_id]
+            if user_id in self.pending_input_retries:
+                del self.pending_input_retries[user_id]
+            
+            # Возвращаемся в меню общих настроек
+            await self.show_general_settings(callback)
+            await callback.answer("❌ Редактирование отменено")
+            
+        except Exception as e:
+            logger.error(f"Ошибка отмены редактирования: {str(e)}", exc_info=True)
+            await callback.answer("⚠️ Ошибка отмены операции")
+
+    async def handle_cancel_edit(self, callback: CallbackQuery, edit_type: str):
+        """Универсальная отмена редактирования"""
+        try:
+            handler = getattr(self, f"cancel_{edit_type}_edit", None)
+            if handler and callable(handler):
+                await handler(callback)
+            else:
+                # Стандартная обработка при отсутствии специфического обработчика
+                user_id = callback.from_user.id
+                if user_id in self.pending_input:
+                    del self.pending_input[user_id]
+                if user_id in self.pending_input_timeouts:
+                    del self.pending_input_timeouts[user_id]
+                
+                await self.send_main_menu(user_id, callback.message.chat.id)
+                await callback.answer("❌ Операция отменена")
+        except Exception as e:
+            logger.error(f"Ошибка универсальной отмены: {str(e)}", exc_info=True)
+            await callback.answer("⚠️ Ошибка отмены операции")
 
     async def edit_ai_settings(self, callback: CallbackQuery) -> None:
         """Переходит в режим редактирования настроек AI"""
@@ -427,13 +629,23 @@ class AsyncTelegramBot:
 
     async def set_ai_temp_custom(self, callback: CallbackQuery) -> None:
         """Запрашивает ручной ввод температуры"""
+        user_id = callback.from_user.id
+        
+        self.pending_input[user_id] = {
+            'param': 'temperature',
+            'type': 'ai',
+            'chat_id': callback.message.chat.id,
+        }
+        self.pending_input_timeouts[user_id] = time.time() + 300
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_ai")]
+        ])
+        
         await callback.message.answer(
-            "Введите значение температуры (0.1-1.0):",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_ai_settings")]]
-            )
+            "✏️ Введите значение температуры (0.1-1.0):\nПример: 0.7",
+            reply_markup=keyboard
         )
-        # Здесь будет логика ожидания ввода пользователя (реализуется в handle_message)
         await callback.answer()
 
     async def set_ai_tokens(self, callback: CallbackQuery) -> None:
@@ -445,13 +657,23 @@ class AsyncTelegramBot:
 
     async def set_ai_tokens_custom(self, callback: CallbackQuery) -> None:
         """Запрашивает ручной ввод количества токенов"""
+        user_id = callback.from_user.id
+        
+        self.pending_input[user_id] = {
+            'param': 'max_tokens',
+            'type': 'ai',
+            'chat_id': callback.message.chat.id,
+        }
+        self.pending_input_timeouts[user_id] = time.time() + 300
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_ai")]
+        ])
+        
         await callback.message.answer(
-            "Введите максимальное количество токенов (500-10000):",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="◀️ Отмена", callback_data="edit_ai_settings")]]
-            )
+            "✏️ Введите максимальное количество токенов (500-10000):\nПример: 2500",
+            reply_markup=keyboard
         )
-        # Здесь будет логика ожидания ввода пользователя (реализуется в handle_message)
         await callback.answer()
 
     async def save_ai_settings(self, callback: CallbackQuery) -> None:
@@ -584,77 +806,142 @@ class AsyncTelegramBot:
         else:
             await callback.answer("Данные не изменились")
 
-    # В обработчик сообщений нужно добавить:
+    async def handle_retry_input(self, callback: CallbackQuery):
+        """Повторный запрос ввода после ошибки"""
+        user_id = callback.from_user.id
+        param = callback.data.replace("retry_", "")
+        
+        if user_id not in self.pending_input:
+            await callback.answer("❌ Сессия ввода утеряна")
+            return
+            
+        input_data = self.pending_input[user_id]
+        
+        await callback.message.answer(
+            f"✏️ Введите новое значение для '{param}':\n(Ошибка: {input_data.get('last_error', '')})",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_edit_{input_data['type']}")]
+            ])
+        )
+        await callback.answer()
+
     async def handle_message(self, message: Message) -> None:
-        """Обработчик текстовых сообщений"""
+        """Обработчик текстовых сообщений с подтверждением изменений"""
         if not await self.is_owner(message):
             return
+            
+        user_id = message.from_user.id
+        text = message.text.strip()
+        
+        # Обработка ожидаемых вводов параметров
+        if user_id in self.pending_input:
+            input_data = self.pending_input[user_id]
+            param = input_data['param']
+            param_type = input_data.get('type', 'general')
+            
+            try:
+                # Удаляем ожидание ввода сразу (чтобы избежать рекурсии)
+                del self.pending_input[user_id]
                 
-        # Обработка ручного ввода значений для AI
-        if message.reply_to_message:
-            reply_text = message.reply_to_message.text
-            
-            if "температуры" in reply_text:
-                try:
-                    temp = float(message.text)
-                    if 0.1 <= temp <= 1.0:
-                        await self.ui.update_ai_setting(message.from_user.id, "temperature", temp)
-                        await self.show_ai_settings(message, edit_mode=True)
-                        await message.answer(f"✅ Температура установлена: {temp}")
-                    else:
-                        await message.answer("❌ Значение должно быть между 0.1 и 1.0")
-                except ValueError:
-                    await message.answer("❌ Введите число (например: 0.7)")
+                # Валидация в зависимости от типа параметра
+                if param in ['temperature', 'yagpt_temperature']:
+                    value = self.validator.validate_temperature(text)
+                elif param in ['max_tokens', 'yagpt_max_tokens']:
+                    value = self.validator.validate_tokens(text)
+                elif param in ['check_interval', 'min_delay_between_posts']:
+                    value = self.validator.validate_interval(text)
+                elif param in ['enable_yagpt', 'image_fallback']:
+                    value = self.validator.validate_boolean(text)
+                else:
+                    # Общая валидация для числовых параметров
+                    min_val, max_val = 1, 10000
+                    value = self.validator.validate_integer(text, min_val, max_val)
                     
-            elif "токенов" in reply_text:
-                try:
-                    tokens = int(message.text)
-                    if 500 <= tokens <= 10000:
-                        await self.ui.update_ai_setting(message.from_user.id, "max_tokens", tokens)
-                        await self.show_ai_settings(message, edit_mode=True)
-                        await message.answer(f"✅ Макс. токенов установлено: {tokens}")
-                    else:
-                        await message.answer("❌ Значение должно быть между 500 и 10000")
-                except ValueError:
-                    await message.answer("❌ Введите целое число (например: 2500)")
+                # Обновление параметра
+                if param_type == 'ai':
+                    await self.ui.update_ai_setting(user_id, param, value)
+                    await message.answer(f"✅ Установлено: {param} = {value}")
+                    # Используем универсальный метод
+                    await self.show_ai_settings(message, edit_mode=True)
+                elif param_type == 'general':
+                    await self.ui.update_general_setting(user_id, param, value)
+                    await message.answer(f"✅ Установлено: {param} = {value}")
+                    # Используем универсальный метод
+                    await self.show_general_settings(message, edit_mode=True)
                     
-        # Обработка добавления новой RSS-ленты
-        if message.reply_to_message and "Введите URL новой RSS-ленты:" in message.reply_to_message.text:
-            url = message.text.strip()
-            
-            # Проверка валидности URL
+                # Сброс счетчика попыток
+                if user_id in self.pending_input_retries:
+                    del self.pending_input_retries[user_id]
+                    
+            except ValueError as e:
+                # Сохраняем контекст для повторной попытки
+                input_data['last_error'] = str(e)
+                self.pending_input[user_id] = input_data
+                
+                # Счетчик попыток
+                retries = self.pending_input_retries.get(user_id, 0) + 1
+                self.pending_input_retries[user_id] = retries
+                
+                if retries >= 3:
+                    await message.answer(f"❌ Слишком много ошибок. Операция отменена.\nОшибка: {str(e)}")
+                    del self.pending_input[user_id]
+                    del self.pending_input_retries[user_id]
+                    return
+                    
+                # Клавиатура с кнопкой отмены
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [  # Один ряд с двумя кнопками
+                        InlineKeyboardButton(text="↩️ Повторить ввод", callback_data=f"retry_{param}"),
+                        InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_edit_{param_type}")
+                    ]
+                ])
+                
+                await message.answer(
+                    f"❌ Ошибка: {str(e)}\n\nПопробуйте еще раз:",
+                    reply_markup=keyboard
+                )
+                return
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки ввода: {str(e)}")
+                await message.answer("❌ Произошла ошибка при обработке значения")
+                return
+        
+        # Обработка добавления RSS
+        if message.reply_to_message and ("rss" in message.reply_to_message.text.lower() or "лент" in message.reply_to_message.text.lower()):
+            url = text
             if not url.startswith(('http://', 'https://')):
                 await message.answer("❌ Некорректный URL. Должен начинаться с http:// или https://")
                 return
                 
-            # Проверка на дубликат
             if url in self.config.RSS_URLS:
                 await message.answer("⚠️ Эта RSS-лента уже есть в списке")
                 return
                 
             try:
-                # Добавляем новую ленту
                 self.config.RSS_URLS.append(url)
-                self.config.RSS_ACTIVE.append(True)  # активна по умолчанию
-                
-                # Сохраняем в .env
+                self.config.RSS_ACTIVE.append(True)
                 self.config.save_to_env_file("RSS_URLS", json.dumps(self.config.RSS_URLS))
                 self.config.save_to_env_file("RSS_ACTIVE", json.dumps(self.config.RSS_ACTIVE))
                 
-                # Обновляем состояние в контроллере
                 if self.controller:
                     self.controller.update_rss_state(self.config.RSS_URLS, self.config.RSS_ACTIVE)
                 
-                await message.answer(f"✅ RSS-лента добавлена: {url}")
+                await message.answer(f"✅ RSS-лента успешно добавлена:\n{url}")
                 
-                # Показываем обновленные настройки RSS
-                await self.show_rss_settings(message)
-                return
-                
+                # Показываем обновленный список
+                if self.controller:
+                    feeds = self.controller.get_rss_status()
+                    text, keyboard = await self.ui.rss_settings_view(feeds)
+                    await message.answer("📋 Обновленный список RSS-лент:", reply_markup=keyboard)
             except Exception as e:
                 logger.error(f"Ошибка добавления RSS: {str(e)}")
-                await message.answer(f"❌ Ошибка добавления RSS: {str(e)}")
-
+                await message.answer(f"❌ Ошибка при добавлении RSS-ленты:\n{str(e)}")
+            return
+        
+        # Если сообщение не распознано как ввод параметра
+        await self.send_main_menu(user_id, message.chat.id)
+        
     async def show_rss_settings(self, callback: CallbackQuery, edit_mode: bool = False):
         """Показывает настройки RSS с возможностью редактирования"""
         if not self.controller:
@@ -1199,4 +1486,6 @@ class AsyncTelegramBot:
             )
 
     async def close(self) -> None:
+        if hasattr(self, 'cleanup_task'):
+            self.cleanup_task.cancel()
         await self.bot.session.close()
