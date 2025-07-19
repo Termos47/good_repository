@@ -1,5 +1,6 @@
 .env
 .env.bak
+bot_state.json
 /__pycache__
 /logs
 /fonts
