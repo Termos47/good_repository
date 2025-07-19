@@ -1,35 +1,26 @@
 import json
 import os
 import logging
-from datetime import datetime
-import hashlib
-from typing import Dict, Any, Optional, List
-import shutil
-import re
-from collections import OrderedDict
-from pathlib import Path
 import tempfile
+import shutil
+import time
+import re
+import hashlib
+from pathlib import Path
+from collections import OrderedDict
+from typing import Dict, Any, Optional, List
+from datetime import datetime
 from config import Config
 
 logger = logging.getLogger('StateManager')
 
 class StateManager:
-    """
-    Улучшенный менеджер состояния бота с расширенными возможностями
+    """Улучшенный менеджер состояния с обработкой блокировок и резервным копированием"""
     
-    Основные улучшения:
-    - Поддержка Path для работы с файлами
-    - Более безопасное создание временных файлов
-    - Улучшенная валидация состояния
-    - Поддержка сжатия старых записей
-    - Расширенное логирование
-    - Оптимизированное управление памятью
-    - Поддержка контекстного менеджера
-    """
-    
-    VERSION = 1.3
+    VERSION = 1.4
     DEFAULT_MAX_ENTRIES = 1000
     BACKUP_DIR = "state_backups"
+    LOCK_TIMEOUT = 60  # 60 секунд таймаут блокировки
     
     def __init__(self, state_file: str = 'bot_state.json', max_entries: int = DEFAULT_MAX_ENTRIES, config: Config = None):
         self.state_file = Path(state_file)
@@ -37,10 +28,13 @@ class StateManager:
         self.backup_dir = Path(self.BACKUP_DIR)
         self._temp_dir = Path(tempfile.gettempdir())
         self._lock_file = self.state_file.with_suffix('.lock')
-        self.editing_state = {}
         self.config = config
+        self.lock_acquired = False
         
-        # Инициализация состояния по умолчанию
+        # Очистка устаревших блокировок при инициализации
+        self._cleanup_stale_lock()
+        
+        # Инициализация состояния
         self.state: Dict[str, Any] = {
             'sent_entries': OrderedDict(),
             'sent_hashes': OrderedDict(),
@@ -66,10 +60,39 @@ class StateManager:
             self.save_state()
         return False
 
-    @staticmethod
-    def _current_timestamp() -> str:
-        """Возвращает текущую временную метку в ISO формате"""
-        return datetime.now().isoformat()
+    def _cleanup_stale_lock(self):
+        """Удаляет устаревшие lock-файлы"""
+        if self._lock_file.exists():
+            try:
+                lock_age = time.time() - self._lock_file.stat().st_mtime
+                if lock_age > self.LOCK_TIMEOUT:
+                    self._lock_file.unlink()
+                    logger.warning(f"Removed stale lock file: {self._lock_file}")
+            except Exception as e:
+                logger.error(f"Failed to remove stale lock: {str(e)}")
+
+    def _acquire_lock(self) -> bool:
+        """Пытается получить файловую блокировку с таймаутом"""
+        start_time = time.time()
+        while time.time() - start_time < self.LOCK_TIMEOUT:
+            try:
+                if not self._lock_file.exists():
+                    self._lock_file.touch()
+                    self.lock_acquired = True
+                    return True
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Lock acquisition failed: {str(e)}")
+        return False
+
+    def _release_lock(self) -> None:
+        """Освобождает файловую блокировку"""
+        try:
+            if self.lock_acquired and self._lock_file.exists():
+                self._lock_file.unlink()
+                self.lock_acquired = False
+        except Exception as e:
+            logger.error(f"Failed to release lock: {str(e)}")
 
     def _ensure_directories(self) -> None:
         """Создает необходимые директории"""
@@ -100,14 +123,12 @@ class StateManager:
     def _validate_state(self, state: Dict[str, Any]) -> bool:
         """Расширенная проверка целостности структуры состояния"""
         try:
-            # Проверка наличия обязательных ключей
             required_keys = {'sent_entries', 'sent_hashes', 'stats', 'metadata'}
             if not required_keys.issubset(state.keys()):
                 missing = required_keys - state.keys()
                 logger.warning(f"Missing required keys in state: {missing}")
                 return False
                 
-            # Проверка типов основных структур
             type_checks = [
                 ('sent_entries', dict),
                 ('sent_hashes', dict),
@@ -120,7 +141,6 @@ class StateManager:
                     logger.warning(f"{key} should be a {expected_type.__name__}")
                     return False
                     
-            # Проверка формата записей и хешей
             for key in state['sent_entries']:
                 if not self._is_valid_entry_id(key):
                     logger.warning(f"Invalid entry key format: {key}")
@@ -131,7 +151,6 @@ class StateManager:
                     logger.warning(f"Invalid hash key format: {key}")
                     return False
                     
-            # Проверка метаданных
             metadata = state['metadata']
             if not isinstance(metadata.get('version'), (int, float)):
                 logger.warning("Invalid version in metadata")
@@ -152,26 +171,6 @@ class StateManager:
         """Проверяет валидность хеш-значения"""
         return isinstance(hash_value, str) and len(hash_value) == 64 and bool(re.match(r'^[a-f0-9]{64}$', hash_value))
 
-    def _acquire_lock(self) -> bool:
-        """Пытается получить файловую блокировку"""
-        try:
-            if self._lock_file.exists():
-                return False
-                
-            self._lock_file.touch()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to acquire lock: {e}")
-            return False
-
-    def _release_lock(self) -> None:
-        """Освобождает файловую блокировку"""
-        try:
-            if self._lock_file.exists():
-                self._lock_file.unlink()
-        except Exception as e:
-            logger.error(f"Failed to release lock: {e}")
-
     def load_state(self) -> None:
         """Безопасная загрузка состояния с улучшенной обработкой ошибок"""
         if not self.state_file.exists():
@@ -179,7 +178,6 @@ class StateManager:
             return
             
         try:
-            # Чтение с проверкой содержимого
             with self.state_file.open('r', encoding='utf-8') as f:
                 data = f.read()
                 
@@ -187,11 +185,8 @@ class StateManager:
                 raise ValueError("State file is empty")
                 
             loaded_state = json.loads(data, object_pairs_hook=OrderedDict)
-            
-            # Обработка миграций для разных версий
             loaded_state = self._migrate_state(loaded_state)
             
-            # Проверка целостности
             if not self._validate_state(loaded_state):
                 raise ValueError("Invalid state structure")
                 
@@ -202,7 +197,6 @@ class StateManager:
             backup_file = self._create_backup()
             logger.error(f"Failed to load state: {str(e)}. Backup created: {backup_file}")
             
-            # Создаем чистое состояние с информацией о восстановлении
             self.state = {
                 'sent_entries': OrderedDict(),
                 'sent_hashes': OrderedDict(),
@@ -220,13 +214,11 @@ class StateManager:
         """Выполняет миграцию состояния из старых версий"""
         version = state.get('metadata', {}).get('version', 1.0)
         
-        # Миграция с версии 1.0
         if version < 1.1:
             logger.info(f"Migrating state from version {version} to 1.1")
             if 'sent_entries' in state and isinstance(state['sent_entries'], list):
                 state = self._convert_legacy_state(state)
                 
-        # Миграция с версии 1.1 и 1.2
         if version < self.VERSION:
             logger.info(f"Migrating state from version {version} to {self.VERSION}")
             state['metadata']['version'] = self.VERSION
@@ -241,15 +233,17 @@ class StateManager:
             return False
             
         try:
-            # Обновляем метаданные
-            self.state['metadata'].update({
+            metadata_update = {
                 'last_modified': self._current_timestamp(),
-                'enable_yagpt': self.config.ENABLE_YAGPT,
                 'entries_count': len(self.state['sent_entries']),
                 'hashes_count': len(self.state['sent_hashes'])
-            })
+            }
             
-            # Создаем временный файл в безопасном месте
+            if self.config:
+                metadata_update['enable_yagpt'] = self.config.ENABLE_YAGPT
+                
+            self.state['metadata'].update(metadata_update)
+            
             with tempfile.NamedTemporaryFile(
                 mode='w',
                 encoding='utf-8',
@@ -260,11 +254,9 @@ class StateManager:
                 temp_path = Path(tmp_file.name)
                 json.dump(self.state, tmp_file, indent=2, ensure_ascii=False)
                 
-            # Проверяем целостность временного файла
             with temp_path.open('r') as f:
-                json.load(f)  # Проверка на валидность JSON
+                json.load(f)
                 
-            # Переносим временный файл в конечное расположение
             temp_path.replace(self.state_file)
             logger.info(f"State saved successfully to {self.state_file}")
             return True
@@ -275,6 +267,11 @@ class StateManager:
             return False
         finally:
             self._release_lock()
+
+    @staticmethod
+    def _current_timestamp() -> str:
+        """Возвращает текущую временную метку в ISO формате"""
+        return datetime.now().isoformat()
 
     def is_entry_sent(self, entry_id: str) -> bool:
         """Проверяет, был ли отправлен пост с данным ID"""
@@ -290,12 +287,10 @@ class StateManager:
         timestamp = self._current_timestamp()
         self.state['sent_entries'][post_id] = timestamp
         
-        # Добавляем хеш контента
         content_hash = self._generate_content_hash(post)
         if content_hash:
             self.state['sent_hashes'][content_hash] = timestamp
             
-        # Автоматическая очистка старых записей
         if len(self.state['sent_entries']) > self.max_entries * 1.2:
             self.cleanup_old_entries()
 
@@ -322,14 +317,12 @@ class StateManager:
         removed_entries = 0
         removed_hashes = 0
         
-        # Удаляем старые записи
         while len(self.state['sent_entries']) > self.max_entries:
             self.state['sent_entries'].popitem(last=False)
             removed_entries += 1
             
-        # Удаляем старые хеши (если их слишком много)
         if len(self.state['sent_hashes']) > self.max_entries * 1.5:
-            oldest_entry_time = next(iter(self.state['sent_entries'].values()), None)
+            oldest_entry_time = next(iter(self.state['sent_entries'].values())), None
             if oldest_entry_time:
                 hashes_to_remove = [
                     h for h, t in self.state['sent_hashes'].items()
@@ -344,19 +337,16 @@ class StateManager:
 
     def compress_state(self) -> None:
         """Сжимает состояние, удаляя дубликаты и оптимизируя структуру"""
-        # Удаляем записи, для которых есть хеш, но нет самого entry
         hashes_to_keep = {
             self._generate_content_hash({'title': '', 'description': k})
             for k in self.state['sent_entries']
         }
         
-        # Оставляем только актуальные хеши
         self.state['sent_hashes'] = OrderedDict(
             (k, v) for k, v in self.state['sent_hashes'].items()
             if k in hashes_to_keep
         )
         
-        # Оптимизируем статистику
         if 'stats' in self.state and not self.state['stats']:
             del self.state['stats']
 
@@ -379,7 +369,7 @@ class StateManager:
         }
 
     def update_stats(self, stats: Dict[str, Any]) -> None:
-        """Обновляет статистику в состоянии (добавлен для совместимости)"""
+        """Обновляет статистику в состоянии"""
         if not isinstance(stats, dict):
             logger.warning("Stats should be a dictionary")
             return
@@ -391,7 +381,7 @@ class StateManager:
         logger.debug(f"Updated stats with {len(stats)} items")
 
     def _convert_legacy_state(self, legacy_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Конвертирует старый формат состояния в новый (добавлен для совместимости)"""
+        """Конвертирует старый формат состояния в новый"""
         new_state = {
             'sent_entries': OrderedDict(),
             'sent_hashes': OrderedDict(),
@@ -404,14 +394,12 @@ class StateManager:
             }
         }
         
-        # Перенос записей из старого формата
         for entry in legacy_state.get('sent_entries', []):
             if isinstance(entry, dict) and 'post_id' in entry:
                 post_id = entry['post_id']
                 pub_date = entry.get('pub_date', self._current_timestamp())
                 new_state['sent_entries'][post_id] = pub_date
         
-        # Перенос хешей, если есть
         if 'entry_hashes' in legacy_state and isinstance(legacy_state['entry_hashes'], list):
             for hash_val in legacy_state['entry_hashes']:
                 if self._is_valid_hash(hash_val):

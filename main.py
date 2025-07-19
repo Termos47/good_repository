@@ -28,20 +28,26 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 logger = logging.getLogger('AsyncMain')
 load_dotenv()
 
-async def shutdown(loop, controller):
+async def shutdown(loop, controller, connector):
     """Корректное завершение работы"""
     logger.info("Shutting down...")
     try:
         if controller:
-            controller.state.save_state()
             await controller.stop()
     except Exception as e:
-        logger.error(f"Error during shutdown: {str(e)}")
-    finally:
+        logger.error(f"Controller shutdown error: {str(e)}")
+    
+    if connector:
         try:
-            loop.stop()
-        except RuntimeError:
-            pass
+            await connector.close()
+            logger.info("TCP connector closed")
+        except Exception as e:
+            logger.error(f"Error closing connector: {str(e)}")
+    
+    try:
+        loop.stop()
+    except RuntimeError:
+        pass
 
 def setup_logging(debug_mode: bool = False) -> None:
     """Настройка логирования"""
@@ -90,7 +96,7 @@ async def test_bot_commands(bot: AsyncTelegramBot, owner_id: int):
     try:
         await bot.bot.send_message(
             chat_id=owner_id,
-            text="🤖 Бот успешно запущен и готов к работе! Для добавления новых RSS используйте команду /rss_add, функция для интерактивного управления в разарботке",
+            text="🤖 Бот успешно запущен и готов к работе! Для добавления новых RSS используйте команду /rss_add",
             parse_mode="HTML"
         )
         return True
@@ -116,7 +122,7 @@ async def run_bot():
         return
     
     # Инициализация StateManager
-    state_manager = StateManager(config.STATE_FILE, config.MAX_ENTRIES_HISTORY)
+    state_manager = StateManager(config.STATE_FILE, config.MAX_ENTRIES_HISTORY, config)
     logger.info("State manager initialized")
     
     # Создаем TCP коннектор для aiohttp
@@ -218,7 +224,7 @@ async def run_bot():
                         await asyncio.sleep(1)
                 except asyncio.CancelledError:
                     logger.info("Ctrl+C received, shutting down")
-                    await shutdown(asyncio.get_running_loop(), controller)
+                    await shutdown(asyncio.get_running_loop(), controller, connector)
             
             shutdown_task = asyncio.create_task(windows_shutdown_handler())
         else:
@@ -227,7 +233,7 @@ async def run_bot():
             for s in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(
                     s, 
-                    lambda s=s: asyncio.create_task(shutdown(loop, controller))
+                    lambda s=s: asyncio.create_task(shutdown(loop, controller, connector))
                 )
         
         logger.info("Bot started successfully. Press Ctrl+C to stop.")
@@ -282,11 +288,12 @@ async def run_bot():
                 logger.error(f"Error closing aiohttp session: {str(e)}")
         
         # Закрытие коннектора
-        try:
-            await connector.close()
-            logger.info("TCP connector closed")
-        except Exception as e:
-            logger.error(f"Error closing connector: {str(e)}")
+        if connector:
+            try:
+                await connector.close()
+                logger.info("TCP connector closed")
+            except Exception as e:
+                logger.error(f"Error closing connector: {str(e)}")
         
         logger.info("===== ASYNC BOT STOPPED =====")
 

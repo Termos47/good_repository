@@ -8,6 +8,8 @@ import PIL
 import aiofiles
 import aiohttp
 import re
+import concurrent.futures
+import psutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any, Union
 from urllib.parse import urlparse
@@ -24,7 +26,7 @@ class BotController:
         self.config = config
         self.state_manager = StateManager(
             state_file=config.STATE_FILE,
-            config=config  # Передаем конфиг
+            config=config
         )
         self.rss_parser = rss_parser
         self.image_generator = image_generator
@@ -42,7 +44,14 @@ class BotController:
         self.is_running = False
         self.cleanup_task = None
         self.rss_task = None
+        self.session_refresh_task = None
+        self.task_monitor_task = None
         self.last_post_time = 0.0
+        
+        # Инициализация ProcessPoolExecutor для генерации изображений
+        self.image_executor = concurrent.futures.ProcessPoolExecutor(
+            max_workers=config.IMAGE_GENERATION_WORKERS
+        )
         
         # Статистика
         self.stats = {
@@ -119,6 +128,17 @@ class BotController:
                 self.config.YANDEX_API_ENDPOINT and
                 self.active)
 
+    async def _create_session(self) -> aiohttp.ClientSession:
+        """Создает новую aiohttp сессию"""
+        return aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(
+                force_close=True,
+                enable_cleanup_closed=True,
+                limit=0
+            ),
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+
     async def start(self) -> bool:
         """Запуск основных процессов бота"""
         if self.is_running:
@@ -126,7 +146,7 @@ class BotController:
             return False
             
         try:
-            self.session = aiohttp.ClientSession()
+            self.session = await self._create_session()
             self.image_semaphore = asyncio.Semaphore(self.config.MAX_CONCURRENT_IMAGE_TASKS)
             self.is_running = True
             self.last_post_time = time.time()
@@ -136,6 +156,8 @@ class BotController:
             # Запуск основных задач
             self.rss_task = asyncio.create_task(self._rss_processing_loop())
             self.cleanup_task = asyncio.create_task(self._cleanup_loop())
+            self.session_refresh_task = asyncio.create_task(self._session_refresh_loop())
+            self.task_monitor_task = asyncio.create_task(self._task_monitor_loop())
             
             return True
         except Exception as e:
@@ -161,16 +183,21 @@ class BotController:
             if self.cleanup_task and not self.cleanup_task.done():
                 self.cleanup_task.cancel()
                 tasks.append(self.cleanup_task)
+            if self.session_refresh_task and not self.session_refresh_task.done():
+                self.session_refresh_task.cancel()
+                tasks.append(self.session_refresh_task)
+            if self.task_monitor_task and not self.task_monitor_task.done():
+                self.task_monitor_task.cancel()
+                tasks.append(self.task_monitor_task)
             
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             
-            # Сохранение состояния и очистка ресурсов
+            # Закрытие сессии и очистка ресурсов
             await self._safe_shutdown()
             
-            # ИСПРАВЛЕНИЕ: Сохраняем ВСЁ состояние перед выходом
-            if self.state_manager:
-                self.state_manager.save_state()
+            # Сохранение состояния
+            self.state_manager.save_state()
             
             logger.info("Controller stopped successfully")
             return True
@@ -184,6 +211,80 @@ class BotController:
             await self.session.close()
         if hasattr(self.image_generator, 'shutdown'):
             self.image_generator.shutdown()
+        if self.image_executor:
+            self.image_executor.shutdown(wait=False)
+
+    async def _session_refresh_loop(self):
+        """Периодическое обновление HTTP-сессии"""
+        logger.info("Starting session refresh loop")
+        while self.is_running:
+            try:
+                await asyncio.sleep(3600)  # Каждый час
+                
+                if self.session:
+                    logger.info("Refreshing HTTP session...")
+                    await self.session.close()
+                    self.session = await self._create_session()
+                    
+                    # Обновляем сессии в зависимых компонентах
+                    self.rss_parser.session = self.session
+                    if self.yandex_gpt:
+                        self.yandex_gpt.session = self.session
+                        
+                    logger.info("HTTP session refreshed successfully")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Session refresh failed: {str(e)}")
+                # Повторить через 5 минут при ошибке
+                await asyncio.sleep(300)
+
+    async def _task_monitor_loop(self):
+        """Мониторинг и очистка асинхронных задач"""
+        logger.info("Starting task monitor loop")
+        max_tasks = 500  # Максимальное количество задач
+        while self.is_running:
+            try:
+                await asyncio.sleep(300)  # Проверка каждые 5 минут
+                await self._cleanup_tasks(max_tasks)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Task monitor error: {str(e)}")
+
+    async def _cleanup_tasks(self, max_tasks: int):
+        """Очистка завершенных и старых задач"""
+        try:
+            # Получаем все текущие задачи, кроме текущей
+            current_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            task_count = len(current_tasks)
+            
+            if task_count <= max_tasks:
+                return
+                
+            logger.warning(f"High task count: {task_count}/{max_tasks}, performing cleanup...")
+            
+            # Собираем завершенные задачи
+            finished_tasks = [t for t in current_tasks if t.done()]
+            
+            # Собираем самые старые активные задачи для отмены
+            tasks_to_cancel = sorted(
+                [t for t in current_tasks if not t.done()],
+                key=lambda t: t.get_name() if hasattr(t, 'get_name') else str(t),
+                reverse=True
+            )[:max(0, task_count - max_tasks)]
+            
+            # Отменяем выбранные задачи
+            for task in tasks_to_cancel:
+                if not task.done():
+                    task.cancel()
+            
+            # Ждем завершения отмененных задач
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            
+            logger.info(f"Cleaned up {len(finished_tasks)} finished and {len(tasks_to_cancel)} old tasks")
+        except Exception as e:
+            logger.error(f"Task cleanup failed: {str(e)}")
 
     async def _rss_processing_loop(self):
         """Основной цикл обработки RSS-лент"""
@@ -204,7 +305,7 @@ class BotController:
                 
                 # Сохранение состояния каждые 5 минут
                 if time.time() - last_save_time > 300:
-                    self.state.save_state()
+                    self.state_manager.save_state()
                     last_save_time = time.time()
                     
                 await asyncio.sleep(self.config.CHECK_INTERVAL)
@@ -314,7 +415,7 @@ class BotController:
                 post_id = self._generate_post_id(temp_post)
                 
                 # Проверка дубликата
-                if self.state.is_entry_sent(post_id):
+                if self.state_manager.is_entry_sent(post_id):
                     duplicate_count += 1
                     duplicate_cache.add(post_id)
                     continue
@@ -464,17 +565,9 @@ class BotController:
         stable_data = f"{post.get('link', '')}{post.get('title', '')}"
         return hashlib.md5(stable_data.encode()).hexdigest()
 
-    async def _enforce_post_delay(self):
-        """Соблюдение минимальной задержки между постами"""
-        time_since_last = time.time() - self.last_post_time
-        if time_since_last < self.config.MIN_DELAY_BETWEEN_POSTS:
-            delay = self.config.MIN_DELAY_BETWEEN_POSTS - time_since_last
-            logger.debug("⏳ Ожидание %.1f сек перед следующим постом", delay)
-            await asyncio.sleep(delay)
-
     def _update_stats_after_post(self, post: Dict):
         """Обновление статистики после успешной отправки"""
-        self.state.add_sent_entry(post)
+        self.state_manager.add_sent_entry(post)
         self.stats['posts_sent'] += 1
         self.stats['last_post'] = datetime.now()
         self.last_post_time = time.time()
@@ -491,12 +584,12 @@ class BotController:
             return True
             
         # Проверка дубликата по ID
-        if self.state.is_entry_sent(post_id):
+        if self.state_manager.is_entry_sent(post_id):
             return True
             
         # Проверка дубликата по хешу контента
         content_hash = self._generate_content_hash(post)
-        if content_hash and self.state.is_hash_sent(content_hash):
+        if content_hash and self.state_manager.is_hash_sent(content_hash):
             return True
             
         return False
@@ -741,18 +834,25 @@ class BotController:
                 self.image_semaphore.release()
         return await self._generate_image(title)
 
-    @lru_cache(maxsize=100)
     async def _generate_image(self, title: str) -> Optional[str]:
-        """Генерация изображения с кэшированием"""
+        """Генерация изображения в отдельном процессе"""
         try:
-            logger.debug("Generating image for title: %s", title[:50])
-            image_path = await self.image_generator.generate_image(title)
+            logger.debug(f"Generating image for title: {title[:50]}")
+            loop = asyncio.get_running_loop()
+            
+            # Выносим операцию в отдельный процесс
+            image_path = await loop.run_in_executor(
+                self.image_executor,
+                self.image_generator._sync_generate_image,
+                title
+            )
+            
             if image_path:
                 self.stats['images_generated'] += 1
-                logger.info("Image generated: %s", image_path)
+                logger.info(f"Image generated: {image_path}")
             return image_path
         except Exception as e:
-            logger.error("Image generation failed: %s", str(e), exc_info=True)
+            logger.error(f"Image generation failed: {str(e)}")
             self.stats['image_errors'] += 1
             return None
 
@@ -911,7 +1011,7 @@ class BotController:
 
     def _update_stats_after_post(self, post: Dict):
         """Обновление статистики после успешной отправки поста"""
-        self.state.add_sent_entry(post)
+        self.state_manager.add_sent_entry(post)
         self.stats['posts_sent'] += 1
         self.stats['last_post'] = datetime.now()
         self.last_post_time = time.time()
@@ -984,6 +1084,7 @@ class BotController:
         except Exception as e:
             logger.error(f"Ошибка переключения ленты: {str(e)}")
             return False
+            
     def update_rss_state(self, urls: List[str], active: List[bool]):
         """Обновляет состояние RSS лент"""
         self.config.RSS_URLS = urls
