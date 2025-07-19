@@ -6,6 +6,7 @@ import signal
 import aiohttp
 import traceback
 import platform
+import time
 from dotenv import load_dotenv
 from config import app_config as config
 from aiogram import Bot, Dispatcher
@@ -27,6 +28,45 @@ from logging.handlers import RotatingFileHandler, TimedRotatingFileHandler
 
 logger = logging.getLogger('AsyncMain')
 load_dotenv()
+
+class TelegramLogHandler(logging.Handler):
+    """Кастомный обработчик логов для отправки в Telegram"""
+    def __init__(self, bot, owner_id, notify_level=logging.ERROR):
+        super().__init__()
+        self.bot = bot
+        self.owner_id = owner_id
+        self.notify_level = notify_level
+        self.rate_limit = 60  # секунды между сообщениями
+        self.last_sent = 0
+
+    def emit(self, record):
+        try:
+            # Проверяем уровень важности
+            if record.levelno < self.notify_level:
+                return
+                
+            # Проверка rate limit
+            current_time = time.time()
+            if current_time - self.last_sent < self.rate_limit:
+                return
+                
+            message = self.format(record)
+            asyncio.create_task(self.send_telegram(message))
+            self.last_sent = current_time
+        except Exception as e:
+            print(f"Ошибка в обработчике логов: {str(e)}")
+
+    async def send_telegram(self, message):
+        """Асинхронная отправка сообщения в Telegram"""
+        try:
+            # Отправляем полное сообщение без обрезки
+            await self.bot.send_message(
+                chat_id=self.owner_id,
+                text=f"<b>⚠️ БОТ: {logging.getLevelName(self.notify_level)}</b>\n\n<code>{message}</code>",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки в Telegram: {str(e)}")
 
 async def shutdown(loop, controller, connector):
     """Корректное завершение работы"""
@@ -137,6 +177,7 @@ async def run_bot():
     telegram_bot: Optional[AsyncTelegramBot] = None
     controller: Optional[BotController] = None
     polling_task: Optional[asyncio.Task] = None
+    tg_handler = None
     
     try:
         # Создаем aiohttp сессию
@@ -186,6 +227,19 @@ async def run_bot():
         # Передаем контроллер в Telegram бота
         telegram_bot.controller = controller
         logger.info("Controller linked to Telegram bot")
+        
+        # Добавляем обработчик логов для отправки ошибок в Telegram
+        if config.OWNER_ID:
+            # Определяем уровень уведомлений из конфига
+            notify_level = getattr(logging, config.NOTIFY_LEVEL, logging.ERROR)
+            tg_handler = TelegramLogHandler(
+                bot=telegram_bot.bot,
+                owner_id=config.OWNER_ID,
+                notify_level=notify_level
+            )
+            tg_handler.setFormatter(logging.Formatter('%(name)s - %(levelname)s - %(message)s'))
+            logging.getLogger().addHandler(tg_handler)
+            logger.info("Telegram error handler initialized")
         
         # Запуск контроллера
         if not await controller.start():
@@ -249,8 +303,20 @@ async def run_bot():
         logger.info("Shutdown requested by user")
     except Exception as e:
         logger.critical(f"Fatal error in main loop: {str(e)}\n{traceback.format_exc()}")
+        # Отправляем критическую ошибку владельцу
+        if config.OWNER_ID and telegram_bot:
+            await telegram_bot.bot.send_message(
+                chat_id=config.OWNER_ID,
+                text=f"💥 КРИТИЧЕСКАЯ ОШИБКА\n\n{str(e)}\n\n{traceback.format_exc()}",
+                parse_mode="HTML"
+            )
     finally:
         logger.info("===== SHUTDOWN SEQUENCE STARTED =====")
+        
+        # Удаляем обработчик Telegram из логгера
+        if tg_handler:
+            logging.getLogger().removeHandler(tg_handler)
+            logger.info("Telegram log handler removed")
         
         # Остановка контроллера
         if controller:

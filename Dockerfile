@@ -3,8 +3,10 @@ FROM python:3.11-slim
 
 # Установка системных зависимостей для работы с графикой
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
     libgl1 \
     libglib2.0-0 \
+    python3-dev \
     libsm6 \
     libxext6 \
     libxrender-dev \
@@ -18,6 +20,7 @@ WORKDIR /app
 COPY requirements.txt .
 COPY *.py ./
 COPY *.json ./
+COPY *.env ./
 #COPY templates/ ./templates/
 #COPY fonts/ ./fonts/
 

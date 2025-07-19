@@ -299,6 +299,8 @@ class Config:
         # Настройка базовых параметров
         self.DEBUG_MODE: bool = self.get_env_var('DEBUG_MODE', default=False, var_type=bool)
         setup_logging(self.DEBUG_MODE)
+        self.NOTIFY_LEVEL = self.get_env_var('NOTIFY_LEVEL', default='ERROR')
+        self.NOTIFY_TYPES = self.get_list('NOTIFY_TYPES', ['errors', 'warnings'])
         
         # Настройка логгера для PIL
         pil_logger = get_logger('PIL')
