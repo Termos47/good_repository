@@ -26,7 +26,6 @@ class StateManager:
         self.state_file = Path(state_file)
         self.max_entries = max_entries
         self.backup_dir = Path(self.BACKUP_DIR)
-        self._temp_dir = Path(tempfile.gettempdir())
         self._lock_file = self.state_file.with_suffix('.lock')
         self.config = config
         self.lock_acquired = False
@@ -244,20 +243,45 @@ class StateManager:
                 
             self.state['metadata'].update(metadata_update)
             
-            with tempfile.NamedTemporaryFile(
+            # Создаем временный файл в той же директории, что и основной файл состояния
+            temp_file = tempfile.NamedTemporaryFile(
                 mode='w',
                 encoding='utf-8',
-                dir=self._temp_dir,
+                dir=str(self.state_file.parent),
                 suffix='.tmp',
                 delete=False
-            ) as tmp_file:
-                temp_path = Path(tmp_file.name)
-                json.dump(self.state, tmp_file, indent=2, ensure_ascii=False)
+            )
+            temp_path = Path(temp_file.name)
+            try:
+                # Записываем состояние во временный файл
+                json.dump(self.state, temp_file, indent=2, ensure_ascii=False)
+                temp_file.close()  # Закрываем файл, чтобы убедиться, что все записано
+            except Exception as e:
+                logger.error(f"Failed to write to temp file: {str(e)}")
+                os.unlink(temp_path)
+                return False
                 
-            with temp_path.open('r') as f:
-                json.load(f)
+            # Валидация записанных данных
+            try:
+                with temp_path.open('r') as f:
+                    json.load(f)
+            except json.JSONDecodeError as ve:
+                logger.error(f"Invalid JSON in temp state: {str(ve)}")
+                os.unlink(temp_path)
+                return False
+            except Exception as e:
+                logger.error(f"Error validating temp state: {str(e)}")
+                os.unlink(temp_path)
+                return False
                 
-            temp_path.replace(self.state_file)
+            # Заменяем основной файл
+            try:
+                os.replace(temp_path, self.state_file)
+            except Exception as e:
+                logger.error(f"Failed to replace state file: {str(e)}")
+                os.unlink(temp_path)
+                return False
+                
             logger.info(f"State saved successfully to {self.state_file}")
             return True
             

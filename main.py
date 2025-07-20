@@ -147,7 +147,7 @@ async def test_bot_commands(bot: AsyncTelegramBot, owner_id: int):
     try:
         await bot.bot.send_message(
             chat_id=owner_id,
-            text="🤖 Бот успешно запущен и готов к работе! Для добавления новых RSS используйте команду /rss_add",
+            text="🤖 Бот успешно запущен и готов к работе!",
             parse_mode="HTML"
         )
         return True
