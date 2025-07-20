@@ -1,11 +1,10 @@
 import logging
 import json
 import re
-import time
+import html
 import aiohttp
 import asyncio
 from typing import Dict, Optional
-import html
 
 logger = logging.getLogger('AsyncYandexGPT')
 
@@ -14,45 +13,49 @@ class AsyncYandexGPT:
         self.config = config
         self.session = session
         self.active = bool(config.YANDEX_API_KEY) and config.ENABLE_YAGPT
-        
+
         # Инициализация статистики
         self.stats = {
             'yagpt_used': 0,
             'yagpt_errors': 0,
             'token_usage': 0
         }
-        
+
         # Счетчики ошибок для автоотключения
         self.error_count = 0
         self.consecutive_errors = 0
         self.max_consecutive_errors = 3  # Максимум ошибок перед автоотключением
-        
-        # Маппинг моделей на их URI
+
+        # Корректные URI для моделей (исправлено для Pro)
         self.MODEL_URIS = {
-            'yandexgpt-lite': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
+            'lite': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
+            'pro': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt/latest",  # Исправлено для Pro
             'yandexgpt': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt/latest",
-            'yandexgpt-pro': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-pro/latest",
-            'yandexgpt-lite:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-lite/latest",
-            'yandexgpt:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt/latest",
-            'yandexgpt-pro:latest': f"gpt://{config.YANDEX_FOLDER_ID}/yandexgpt-pro/latest",
         }
-        
+
         self.headers = {
             "Authorization": f"Api-Key {config.YANDEX_API_KEY}",
-            "x-folder-id": self.config.YANDEX_FOLDER_ID,
+            "x-folder-id": config.YANDEX_FOLDER_ID,
             "Content-Type": "application/json"
         }
         logger.info(f"YandexGPT initialized. Active: {self.active}, Model: {config.YAGPT_MODEL}")
 
     def is_available(self) -> bool:
         """Проверяет, доступен ли сервис в текущий момент"""
-        return self.active and self.error_count < self.config.YAGPT_ERROR_THRESHOLD
+        if not self.active:
+            return False
+            
+        # Более строгие ограничения для Pro-модели
+        if self.config.YAGPT_MODEL == 'pro':
+            return self.error_count < 3 and self.consecutive_errors < 2
+            
+        return self.error_count < self.config.YAGPT_ERROR_THRESHOLD
 
     def _sanitize_prompt_input(self, text: str) -> str:
         """Экранирует специальные символы и предотвращает инъекции в промпт"""
         if not isinstance(text, str):
             return ""
-        
+
         sanitized = html.escape(text)
         replacements = {
             '{': '{{',
@@ -67,10 +70,10 @@ class AsyncYandexGPT:
             '\r': ' ',
             '\t': ' '
         }
-        
+
         for char, replacement in replacements.items():
             sanitized = sanitized.replace(char, replacement)
-        
+
         sanitized = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', sanitized)
         return sanitized[:5000]
 
@@ -85,25 +88,36 @@ class AsyncYandexGPT:
         try:
             # Подсчет токенов (простая оценка)
             tokens = len(title.split()) + len(description.split())
-            
+
             # Проверка на превышение лимита токенов
-            if tokens > self.config.YAGPT_MAX_TOKENS * 0.9:  # Оставляем 10% запаса
-                logger.warning(f"Content too long: {tokens}/{self.config.YAGPT_MAX_TOKENS} tokens")
+            max_tokens = min(
+                self.config.YAGPT_MAX_TOKENS,
+                8000 if self.config.YAGPT_MODEL == 'pro' else 2000
+            )
+            
+            if tokens > max_tokens * 0.8:  # Оставляем запас
+                logger.warning(f"Content too long: {tokens}/{max_tokens} tokens")
                 return None
 
             # Формирование промпта
             prompt = self.config.YAGPT_PROMPT.format(
-                title=title,
-                description=description
+                title=self._sanitize_prompt_input(title),
+                description=self._sanitize_prompt_input(description)
+            )
+
+            # Получаем корректный URI модели
+            model_uri = self.MODEL_URIS.get(
+                self.config.YAGPT_MODEL,
+                self.MODEL_URIS['lite']  # Fallback
             )
 
             # Подготовка данных для запроса
             request_data = {
-                "modelUri": f"gpt://{self.config.YANDEX_FOLDER_ID}/{self.config.YAGPT_MODEL}",
+                "modelUri": model_uri,
                 "completionOptions": {
                     "stream": False,
                     "temperature": self.config.YAGPT_TEMPERATURE,
-                    "maxTokens": self.config.YAGPT_MAX_TOKENS
+                    "maxTokens": max_tokens
                 },
                 "messages": [
                     {
@@ -113,88 +127,78 @@ class AsyncYandexGPT:
                 ]
             }
 
+            # Логирование для отладки
+            logger.debug(f"YandexGPT request to {self.config.YANDEX_API_ENDPOINT}")
+            logger.debug(f"Model: {self.config.YAGPT_MODEL}, URI: {model_uri}")
+            logger.debug(f"Prompt: {prompt[:200]}...")
+
             # Отправка запроса
             async with self.session.post(
                 self.config.YANDEX_API_ENDPOINT,
                 headers={
                     "Authorization": f"Api-Key {self.config.YANDEX_API_KEY}",
-                    "Content-Type": "application/json"
+                    "Content-Type": "application/json",
+                    "x-folder-id": self.config.YANDEX_FOLDER_ID
                 },
                 json=request_data,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=60 if self.config.YAGPT_MODEL == 'pro' else 30)
             ) as response:
+
+                response_text = await response.text()
                 
                 if response.status != 200:
-                    error = await response.text()
-                    logger.error(f"Yandex GPT API error: {response.status} - {error}")
+                    self._handle_error(response.status, response_text, request_data)
                     return None
 
-                data = await response.json()
-                result_text = data.get('result', {}).get('alternatives', [{}])[0].get('message', {}).get('text', '')
-                
-                # Логирование сырого ответа для отладки
-                logger.debug(f"Raw Yandex GPT response: {result_text[:200]}...")
+                try:
+                    data = await response.json()
+                except json.JSONDecodeError:
+                    logger.error(f"Invalid JSON response: {response_text[:500]}")
+                    self._handle_error(500, "Invalid JSON", request_data)
+                    return None
 
-                # Парсинг результата с помощью специализированного метода
-                parsed_response = self.parse_response({
-                    'result': {
-                        'alternatives': [{
-                            'message': {'text': result_text}
-                        }]
-                    }
-                })
-                
+                # Логирование сырого ответа
+                logger.debug(f"Raw response: {json.dumps(data, ensure_ascii=False)[:500]}...")
+
+                # Парсинг результата
+                parsed_response = self.parse_response(data)
                 if parsed_response:
+                    self.stats['yagpt_used'] += 1
+                    self.consecutive_errors = 0  # Сброс счетчика ошибок
                     return parsed_response
                 
-                # Fallback: обработка вручную если автоматический парсинг не сработал
-                logger.warning("Falling back to manual response parsing")
-                
-                # Удаление служебных префиксов
-                cleaned_text = re.sub(
-                    r'^(Заголовок|Описание|Title|Description)[:\s]*', 
-                    '', 
-                    result_text, 
-                    flags=re.IGNORECASE | re.MULTILINE
-                )
-                
-                # Разделение на строки
-                lines = [line.strip() for line in cleaned_text.split('\n') if line.strip()]
-                
-                # Обработка случая пустого ответа
-                if not lines:
-                    return None
-                    
-                # Извлечение заголовка (первая непустая строка)
-                enhanced_title = lines[0]
-                
-                # Извлечение описания (все остальные строки)
-                enhanced_description = '\n'.join(lines[1:]) if len(lines) > 1 else description
-
-                # Обрезаем до максимальной длины
-                enhanced_title = enhanced_title[:self.config.MAX_TITLE_LENGTH]
-                enhanced_description = enhanced_description[:self.config.MAX_DESC_LENGTH]
-
-                # Обновление статистики
-                self.stats['yagpt_used'] += 1
-                
-                return {
-                    'title': enhanced_title,
-                    'description': enhanced_description
-                }
+                logger.warning("Failed to parse YandexGPT response")
+                self._handle_error(500, "Parsing failed", request_data)
+                return None
 
         except asyncio.TimeoutError:
             logger.error("Yandex GPT request timeout")
+            self._handle_error(408, "Timeout", {})
             return None
         except Exception as e:
             logger.error(f"Yandex GPT enhancement error: {str(e)}", exc_info=True)
+            self._handle_error(500, str(e), {})
             return None
+
+    def _handle_error(self, status: int, error: str, request_data: dict):
+        """Обрабатывает ошибки и обновляет счетчики"""
+        self.error_count += 1
+        self.consecutive_errors += 1
+        self.stats['yagpt_errors'] += 1
+        
+        logger.error(f"Yandex GPT API error: {status} - {error[:500]}")
+        logger.debug(f"Request body: {json.dumps(request_data, ensure_ascii=False)[:500]}...")
+        
+        # Автоотключение при частых ошибках
+        if self.consecutive_errors >= self.max_consecutive_errors:
+            logger.warning("Disabling YandexGPT due to consecutive errors")
+            self.active = False
 
     def is_low_quality_response(self, text: str) -> bool:
         """Определяет низкокачественный ответ ИИ"""
         if not text:
             return True
-            
+
         quality_indicators = [
             "в интернете есть много сайтов",
             "посмотрите, что нашлось в поиске",
@@ -208,7 +212,7 @@ class AsyncYandexGPT:
             "больше информации можно найти",
             r"\[.*\]\(https?://[^\)]+\)"  # Markdown ссылки
         ]
-        
+
         text_lower = text.lower()
         return any(re.search(phrase, text_lower) for phrase in quality_indicators)
 
@@ -217,9 +221,10 @@ class AsyncYandexGPT:
             if not data.get('result') or not data['result'].get('alternatives'):
                 logger.warning("No alternatives in YandexGPT response")
                 return None
-                
+
             text = data['result']['alternatives'][0]['message']['text']
-            
+            logger.debug(f"Response text: {text[:200]}...")
+
             # Попытка прямого JSON парсинга
             try:
                 start_idx = text.find('{')
@@ -229,47 +234,45 @@ class AsyncYandexGPT:
                     result = json.loads(json_str)
                     if isinstance(result, dict) and 'title' in result and 'description' in result:
                         return {
-                            'title': self._sanitize_text(result['title']),
-                            'description': self._sanitize_text(result['description'])
+                            'title': self._sanitize_text(result['title'])[:self.config.MAX_TITLE_LENGTH],
+                            'description': self._sanitize_text(result['description'])[:self.config.MAX_DESC_LENGTH]
                         }
             except (ValueError, json.JSONDecodeError, AttributeError):
                 pass
-            
+
             # Расширенные шаблоны для извлечения данных
             patterns = [
+                r'(?i)title["\']?:\s*["\'](.+?)["\']',
+                r'(?i)заголовок["\']?:\s*["\'](.+?)["\']',
                 r'(?i)(?:title|заголовок)[\s:]*["\']?(.+?)["\']?(?:\n|$|\.)',
                 r'(?i)(?:description|описание)[\s:]*["\']?(.+?)["\']?(?:\n|$|\.)',
                 r'{"title"\s*:\s*"([^"]+)"[^}]*"description"\s*:\s*"([^"]+)"}',
                 r'<title>(.+?)</title>\s*<description>(.+?)</description>',
                 r'(?i)(?:заголовок|title):?\s*([^\n]+)\n+(?:описание|description):?\s*([^\n]+)'
             ]
-            
+
             title_match = None
             desc_match = None
-            
+
             # Поиск заголовка
             for pattern in patterns:
                 match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-                if match:
-                    for i in range(1, min(3, len(match.groups()) + 1)):
-                        if match.group(i) and len(match.group(i).strip()) > 5:
-                            title_match = match.group(i).strip()
-                            break
-                    if title_match:
+                if match and match.lastindex >= 1:
+                    title_candidate = match.group(1).strip()
+                    if len(title_candidate) > 5:
+                        title_match = title_candidate
                         break
-            
+
             # Поиск описания
             if title_match:
                 for pattern in patterns:
                     match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
-                    if match and len(match.groups()) > 1:
-                        for i in range(2, min(4, len(match.groups()) + 1)):
-                            if match.group(i) and len(match.group(i).strip()) > 10:
-                                desc_match = match.group(i).strip()
-                                break
-                        if desc_match:
+                    if match and match.lastindex >= 2:
+                        desc_candidate = match.group(2).strip()
+                        if len(desc_candidate) > 10:
+                            desc_match = desc_candidate
                             break
-            
+
             # Fallback стратегии
             if not title_match or not desc_match:
                 parts = re.split(r'\n\n|\n-|\n•', text, maxsplit=1)
@@ -284,12 +287,12 @@ class AsyncYandexGPT:
                     else:
                         title_match = text[:100]
                         desc_match = text[100:500] if len(text) > 100 else ""
-            
+
             return {
-                'title': self._sanitize_text(title_match),
-                'description': self._sanitize_text(desc_match)
+                'title': self._sanitize_text(title_match)[:self.config.MAX_TITLE_LENGTH],
+                'description': self._sanitize_text(desc_match)[:self.config.MAX_DESC_LENGTH]
             }
-            
+
         except Exception as e:
             logger.error(f"YandexGPT parsing error: {str(e)}", exc_info=True)
             return None
