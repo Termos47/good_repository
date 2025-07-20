@@ -1,35 +1,18 @@
-# Базовый образ
 FROM python:3.11-slim
 
-# Установка системных зависимостей для работы с графикой
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libgl1 \
-    libglib2.0-0 \
-    python3-dev \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    fontconfig \
-    && rm -rf /var/lib/apt/lists/*
-
-# Рабочая директория
 WORKDIR /app
 
-# Копирование только необходимых файлов
-COPY requirements.txt .
-COPY *.py ./
-COPY *.json ./
-COPY *.env ./
-#COPY templates/ ./templates/
-#COPY fonts/ ./fonts/
+# Установить системные пакеты для сборки C-зависимостей Python
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc python3-dev build-essential && \
+    rm -rf /var/lib/apt/lists/*
 
-# Установка зависимостей
-RUN pip install --no-cache-dir -U pip && \
-    pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt ./
 
-# Создание необходимых директорий
-RUN mkdir -p data logs state_backups temp_images
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Команда запуска
+COPY . .
+
+ENV PYTHONUNBUFFERED=1
+
 CMD ["python", "main.py"]

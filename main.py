@@ -68,7 +68,7 @@ class TelegramLogHandler(logging.Handler):
         except Exception as e:
             print(f"Ошибка отправки в Telegram: {str(e)}")
 
-async def shutdown(loop, controller, connector):
+async def shutdown(controller, connector, session):
     """Корректное завершение работы"""
     logger.info("Shutting down...")
     try:
@@ -77,6 +77,13 @@ async def shutdown(loop, controller, connector):
     except Exception as e:
         logger.error(f"Controller shutdown error: {str(e)}")
     
+    if session and not session.closed:
+        try:
+            await session.close()
+            logger.info("aiohttp session closed")
+        except Exception as e:
+            logger.error(f"Error closing session: {str(e)}")
+    
     if connector:
         try:
             await connector.close()
@@ -84,10 +91,14 @@ async def shutdown(loop, controller, connector):
         except Exception as e:
             logger.error(f"Error closing connector: {str(e)}")
     
-    try:
-        loop.stop()
-    except RuntimeError:
-        pass
+    # Отменяем все оставшиеся задачи
+    tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    for task in tasks:
+        task.cancel()
+    
+    # Ожидаем завершения задач
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 def setup_logging(debug_mode: bool = False) -> None:
     """Настройка логирования"""
@@ -271,33 +282,38 @@ async def run_bot():
         # Для Windows используем альтернативную обработку Ctrl+C
         if platform.system() == 'Windows':
             logger.info("Windows detected, using alternative signal handling")
-            # Создаем задачу для отслеживания Ctrl+C
+            # Создаем событие для отслеживания завершения
+            shutdown_event = asyncio.Event()
+            
+            # Задача для отслеживания Ctrl+C
             async def windows_shutdown_handler():
                 try:
                     while True:
                         await asyncio.sleep(1)
                 except asyncio.CancelledError:
                     logger.info("Ctrl+C received, shutting down")
-                    await shutdown(asyncio.get_running_loop(), controller, connector)
+                    shutdown_event.set()
             
             shutdown_task = asyncio.create_task(windows_shutdown_handler())
         else:
             # Для Unix-систем используем стандартные сигналы
             loop = asyncio.get_running_loop()
+            shutdown_event = asyncio.Event()
+            
             for s in (signal.SIGTERM, signal.SIGINT):
                 loop.add_signal_handler(
                     s, 
-                    lambda s=s: asyncio.create_task(shutdown(loop, controller, connector))
+                    lambda: shutdown_event.set()
                 )
         
         logger.info("Bot started successfully. Press Ctrl+C to stop.")
         
         # Основной цикл ожидания
         try:
-            while True:
-                await asyncio.sleep(3600)  # Спим по 1 часу
+            await shutdown_event.wait()
+            logger.info("Shutdown event triggered")
         except asyncio.CancelledError:
-            logger.info("Main loop cancelled")
+            logger.info("Main task cancelled")
             
     except (KeyboardInterrupt, asyncio.CancelledError):
         logger.info("Shutdown requested by user")
@@ -305,11 +321,14 @@ async def run_bot():
         logger.critical(f"Fatal error in main loop: {str(e)}\n{traceback.format_exc()}")
         # Отправляем критическую ошибку владельцу
         if config.OWNER_ID and telegram_bot:
-            await telegram_bot.bot.send_message(
-                chat_id=config.OWNER_ID,
-                text=f"💥 КРИТИЧЕСКАЯ ОШИБКА\n\n{str(e)}\n\n{traceback.format_exc()}",
-                parse_mode="HTML"
-            )
+            try:
+                await telegram_bot.bot.send_message(
+                    chat_id=config.OWNER_ID,
+                    text=f"💥 КРИТИЧЕСКАЯ ОШИБКА\n\n{str(e)}",
+                    parse_mode="HTML"
+                )
+            except Exception as te:
+                logger.error(f"Failed to send error message: {str(te)}")
     finally:
         logger.info("===== SHUTDOWN SEQUENCE STARTED =====")
         
@@ -318,22 +337,17 @@ async def run_bot():
             logging.getLogger().removeHandler(tg_handler)
             logger.info("Telegram log handler removed")
         
-        # Остановка контроллера
-        if controller:
-            try:
-                await controller.stop()
-                logger.info("Controller stopped")
-            except Exception as e:
-                logger.error(f"Error stopping controller: {str(e)}")
+        try:
+            # Выполняем асинхронную очистку ресурсов
+            await shutdown(controller, connector, session)
+        except Exception as e:
+            logger.error(f"Error during shutdown: {str(e)}")
         
         # Отмена задачи опроса Telegram
         if polling_task and not polling_task.done():
-            polling_task.cancel()
             try:
-                await polling_task
-                logger.info("Telegram polling task cancelled")
-            except asyncio.CancelledError:
-                pass
+                polling_task.cancel()
+                logger.info("Telegram polling task cancellation requested")
             except Exception as e:
                 logger.error(f"Error cancelling polling task: {str(e)}")
         
@@ -345,21 +359,24 @@ async def run_bot():
             except Exception as e:
                 logger.error(f"Error closing Telegram bot: {str(e)}")
         
-        # Закрытие aiohttp сессии
-        if session:
-            try:
-                await session.close()
-                logger.info("aiohttp session closed")
-            except Exception as e:
-                logger.error(f"Error closing aiohttp session: {str(e)}")
+        # Отменяем все оставшиеся задачи
+        current_task = asyncio.current_task()
+        tasks = [t for t in asyncio.all_tasks() if t is not current_task and not t.done()]
         
-        # Закрытие коннектора
-        if connector:
+        if tasks:
+            logger.info(f"Cancelling {len(tasks)} pending tasks")
+            for task in tasks:
+                try:
+                    task.cancel()
+                except Exception as e:
+                    logger.error(f"Error cancelling task: {str(e)}")
+            
+            # Ожидаем завершения задач с обработкой исключений
             try:
-                await connector.close()
-                logger.info("TCP connector closed")
+                await asyncio.gather(*tasks, return_exceptions=True)
             except Exception as e:
-                logger.error(f"Error closing connector: {str(e)}")
+                logger.error(f"Error gathering tasks: {str(e)}")
+            logger.info("All pending tasks cancelled")
         
         logger.info("===== ASYNC BOT STOPPED =====")
 
@@ -376,20 +393,22 @@ if __name__ == "__main__":
     except Exception as e:
         logger.critical(f"Top-level error: {str(e)}\n{traceback.format_exc()}")
     finally:
-        # Гарантированная очистка ресурсов
         try:
-            # Отменяем все оставшиеся задачи
-            pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
-            for task in pending:
-                task.cancel()
-            
-            # Ожидаем завершения задач
-            if pending:
+            # Останавливаем и закрываем цикл только если он не закрыт
+            if not loop.is_closed():
+                # Собираем оставшиеся задачи
+                pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+                
+                # Отменяем все задачи
+                for task in pending:
+                    task.cancel()
+                
+                # Запускаем цикл для обработки отмены
                 loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            
-            # Останавливаем и закрываем цикл
-            loop.stop()
-            loop.close()
+                
+                # Останавливаем и закрываем цикл
+                loop.stop()
+                loop.close()
             logger.info("Event loop stopped and closed")
         except Exception as e:
             logger.error(f"Error during final cleanup: {str(e)}")

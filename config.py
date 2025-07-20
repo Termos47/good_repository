@@ -356,7 +356,7 @@ class Config:
             var_type=str  # Явно указываем тип строки
         )
         self.YAGPT_ERROR_THRESHOLD: int = self.get_env_var('YAGPT_ERROR_THRESHOLD', default=5, var_type=int)
-        self.AUTO_DISABLE_YAGPT: bool = self.get_env_var('AUTO_DISABLE_YAGPT', default=True, var_type=bool)
+        self.AUTO_ENABLE_YAGPT: bool = self.get_env_var('AUTO_ENABLE_YAGPT', default=True, var_type=bool)
         
         # Параметры контента
         self.MIN_TITLE_LENGTH: int = self.get_env_var('MIN_TITLE_LENGTH', default=0, var_type=int)
@@ -431,7 +431,7 @@ class Config:
             'CHECK_INTERVAL': self.CHECK_INTERVAL,
             'MAX_ENTRIES_HISTORY': self.MAX_ENTRIES_HISTORY,
             'YANDEX_API_ENDPOINT': self.YANDEX_API_ENDPOINT,
-            'DISABLE_YAGPT': self.DISABLE_YAGPT,
+            'ENABLE_YAGPT': self.ENABLE_YAGPT,
             'YAGPT_MODEL': self.YAGPT_MODEL,
             'YAGPT_TEMPERATURE': self.YAGPT_TEMPERATURE,
             'YAGPT_MAX_TOKENS': self.YAGPT_MAX_TOKENS,

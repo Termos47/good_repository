@@ -135,6 +135,23 @@ sudo systemctl restart rss-bot
 
 bot_state.json
 
-.env файл
 
-Каталог templates/
+
+
+.env
+.gitignore
+Dockerfile
+README.txt
+bot_controller.py
+bot_state.json
+config.py
+docker-compose.yaml
+image_config.json
+image_generator.py
+main.py
+requirements.txt
+rss_parser.py
+state_manager.py
+telegram_interface.py
+visual_interface.py
+yandex_gpt.py

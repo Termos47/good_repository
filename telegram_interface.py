@@ -1308,7 +1308,7 @@ class AsyncTelegramBot:
             'MIN_DELAY_BETWEEN_POSTS': {'type': int, 'validator': lambda x: x >= 10, 'error_msg': 'Минимальная задержка 10 секунд'},
             'CHECK_INTERVAL': {'type': int, 'validator': lambda x: x >= 60, 'error_msg': 'Интервал проверки не менее 60 секунд'},
             'ENABLE_IMAGE_GENERATION': {'type': bool, 'validator': None},
-            'DISABLE_YAGPT': {'type': bool, 'validator': None},
+            'ENABLE_YAGPT': {'type': bool, 'validator': None},
             'YAGPT_MODEL': {'type': str, 'validator': lambda x: x in ['yandexgpt-lite', 'yandexgpt-pro'], 'error_msg': 'Допустимые модели: yandexgpt-lite, yandexgpt-pro'},
             'YAGPT_TEMPERATURE': {'type': float, 'validator': lambda x: 0.1 <= x <= 1.0, 'error_msg': 'Температура должна быть от 0.1 до 1.0'}
         }

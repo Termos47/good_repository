@@ -1,12 +1,8 @@
 services:
-  telegram-bot:
+  app:
     build: .
-    container_name: tg-bot
-    restart: unless-stopped
     env_file:
       - .env
     volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./state_backups:/app/state_backups
-      - ./temp_images:/app/temp_images
+      - .:/app
+    restart: unless-stopped
