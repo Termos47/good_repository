@@ -54,10 +54,9 @@ class AsyncRSSParser:
         """Асинхронно загружает и парсит RSS-ленту с повторными попытками"""
         if not self.feed_status.get(url, True):
             return None
-
+    
         logger.info(f"Fetching RSS feed: {url}")
         
-        # Добавляем механизм повторных попыток
         for attempt in range(1, self.max_retries + 1):
             try:
                 async with self.session.get(
@@ -75,14 +74,21 @@ class AsyncRSSParser:
                     return await self._safe_parse_feed(content)
 
             except aiohttp.ClientOSError as e:
-                # Обрабатываем только конкретную SSL-ошибку
                 if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e) and attempt < self.max_retries:
                     logger.warning(f"SSL error detected, retrying ({attempt}/{self.max_retries}) for {url}")
                     await asyncio.sleep(self.retry_delay * attempt)
                 else:
-                    # Для других ошибок или последней неудачной попытки
                     self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
                     logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
+                    return None
+                    
+            except RuntimeError as e:
+                if "Session is closed" in str(e):
+                    logger.critical("Session is closed! Recreate the session outside the parser")
+                    return None
+                else:
+                    self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
+                    logger.error(f"RuntimeError fetching {url}: {str(e)}", exc_info=True)
                     return None
                     
             except Exception as e:
@@ -90,7 +96,7 @@ class AsyncRSSParser:
                 logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
                 return None
         
-        return None  # Достигнуто только при исчерпании попыток
+        return None
         
     def get_error_count(self, url: str) -> int:
         """Возвращает количество ошибок для указанного URL"""
