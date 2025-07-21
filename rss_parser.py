@@ -31,10 +31,10 @@ class AsyncRSSParser:
     def __init__(self, session: aiohttp.ClientSession, proxy_url: Optional[str] = None):
         self.session = session
         self.proxy_url = proxy_url
-        self.timeout = aiohttp.ClientTimeout(total=20, sock_read=15)  # Увеличим общий таймаут и добавим отдельный для чтения
+        self.timeout = aiohttp.ClientTimeout(total=30, sock_read=25)  # Увеличенные таймауты
         self.semaphore = asyncio.Semaphore(5)
         self.executor = ProcessPoolExecutor(max_workers=2)
-        self.config = config #===================================================================================================================================
+        self.config = config
         self.feed_status = {}
         self.feed_errors = {}
         self.max_retries = 3  # Максимальное количество попыток
@@ -226,26 +226,41 @@ class AsyncRSSParser:
         return None
 
     async def extract_primary_image(self, url: str) -> Optional[str]:
-        """Извлекает главное изображение со страницы"""
-        try:
-            async with self.session.get(url, timeout=self.timeout) as response:
-                html = await response.text()
-                soup = BeautifulSoup(html, 'html.parser')
+        """Извлекает главное изображение со страницы с повторными попытками"""
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                async with self.session.get(
+                    url,
+                    timeout=self.timeout,
+                    headers={'User-Agent': 'RSSBot/1.0'}  # Добавляем User-Agent
+                ) as response:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
 
-                # 1. Проверка OpenGraph и Twitter Card
-                if meta_image := self._find_meta_image(soup):
-                    return meta_image
+                    # 1. Проверка OpenGraph и Twitter Card
+                    if meta_image := self._find_meta_image(soup):
+                        return meta_image
 
-                # 2. Поиск в основном контенте
-                if content_image := self._find_content_image(soup, url):
-                    return content_image
+                    # 2. Поиск в основном контенте
+                    if content_image := self._find_content_image(soup, url):
+                        return content_image
 
-                # 3. Резервные варианты
-                return self._find_fallback_image(soup, url)
+                    # 3. Резервные варианты
+                    return self._find_fallback_image(soup, url)
 
-        except Exception as e:
-            logger.error(f"Error extracting image from {url}: {str(e)}")
-            return None
+            except (aiohttp.ClientOSError, asyncio.TimeoutError, aiohttp.ServerDisconnectedError) as e:
+                if attempt < self.max_retries:
+                    logger.warning(f"Network error detected, retrying ({attempt}/{self.max_retries}) for {url}")
+                    await asyncio.sleep(self.retry_delay * attempt)
+                else:
+                    logger.error(f"Error extracting image from {url}: {str(e)}")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"Error extracting image from {url}: {str(e)}")
+                return None
+        
+        return None
 
     def _find_meta_image(self, soup: BeautifulSoup) -> Optional[str]:
         """Ищет изображение в мета-тегах"""
