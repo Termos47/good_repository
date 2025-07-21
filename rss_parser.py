@@ -6,7 +6,7 @@ import feedparser
 import logging
 import aiohttp
 import hashlib
-from typing import Any, Dict, List, Optional, Union, Set
+from typing import Any, Dict, List, Optional, Union, Set, Callable
 import asyncio
 from defusedxml import ElementTree as ET
 from io import BytesIO
@@ -28,10 +28,16 @@ class AsyncRSSParser:
         '[itemprop="image"]'
     ]
 
-    def __init__(self, session: aiohttp.ClientSession, proxy_url: Optional[str] = None):
+    def __init__(
+        self, 
+        session: aiohttp.ClientSession, 
+        proxy_url: Optional[str] = None, 
+        on_session_recreate: Optional[Callable] = None  # Добавлен параметр
+    ):
         self.session = session
         self.proxy_url = proxy_url
-        self.timeout = aiohttp.ClientTimeout(total=30, sock_read=25)  # Увеличенные таймауты
+        self.on_session_recreate = on_session_recreate  # Инициализация атрибута
+        self.timeout = aiohttp.ClientTimeout(total=30, sock_read=25)
         self.semaphore = asyncio.Semaphore(5)
         self.executor = ProcessPoolExecutor(max_workers=2)
         self.config = config
@@ -57,8 +63,12 @@ class AsyncRSSParser:
         
         # Проверяем состояние сессии перед выполнением запроса
         if self.session.closed:
-            logger.critical("Session is closed! Skipping fetch request.")
-            return None
+            logger.critical("Session is closed! Attempting to recreate...")
+            if self.on_session_recreate:
+                await self.on_session_recreate()  # Вызываем колбэк восстановления
+            else:
+                logger.error("No session recreation callback available!")
+                return None
 
         logger.info(f"Fetching RSS feed: {url}")
         

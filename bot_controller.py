@@ -17,6 +17,7 @@ from PIL import Image
 from functools import lru_cache
 from bs4 import BeautifulSoup
 from telegram import CallbackQuery
+from rss_parser import AsyncRSSParser
 from state_manager import StateManager
 
 logger = logging.getLogger('bot.controller')
@@ -138,6 +139,23 @@ class BotController:
             ),
             timeout=aiohttp.ClientTimeout(total=30)
         )
+    
+    async def _recreate_session(self):
+        """Пересоздает HTTP-сессию и обновляет зависимости"""
+        logger.critical("Recreating HTTP session due to closed state...")
+        try:
+            if self.session:
+                await self.session.close()
+            self.session = await self._create_session()
+            
+            # Обновляем сессии во всех зависимых компонентах
+            self.rss_parser.session = self.session
+            if self.yandex_gpt:
+                self.yandex_gpt.session = self.session
+                
+            logger.info("HTTP session recreated successfully")
+        except Exception as e:
+            logger.error(f"Session recreation failed: {str(e)}")
 
     async def start(self) -> bool:
         """Запуск основных процессов бота"""
@@ -159,6 +177,11 @@ class BotController:
             self.session_refresh_task = asyncio.create_task(self._session_refresh_loop())
             self.task_monitor_task = asyncio.create_task(self._task_monitor_loop())
             
+            self.rss_parser = AsyncRSSParser(
+            session=self.session,
+            proxy_url=self.config.PROXY_URL,
+            on_session_recreate=self._recreate_session  # Передаем колбэк
+            )
             return True
         except Exception as e:
             logger.error("Failed to start controller: %s", str(e), exc_info=True)
@@ -336,6 +359,10 @@ class BotController:
                 if not self.config.RSS_ACTIVE[i]:
                     logger.debug("⏭ Лента отключена: %s", url)
                     continue
+
+                # Двойная проверка состояния сессии
+                if self.rss_parser.session.closed:
+                    await self._recreate_session()
                     
                 logger.debug("📥 Загрузка ленты: %s", url)
                 start_time = time.time()
