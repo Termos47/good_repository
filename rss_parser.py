@@ -54,11 +54,21 @@ class AsyncRSSParser:
         """Асинхронно загружает и парсит RSS-ленту с повторными попытками"""
         if not self.feed_status.get(url, True):
             return None
-    
+        
+        # Проверяем состояние сессии перед выполнением запроса
+        if self.session.closed:
+            logger.critical("Session is closed! Skipping fetch request.")
+            return None
+
         logger.info(f"Fetching RSS feed: {url}")
         
         for attempt in range(1, self.max_retries + 1):
             try:
+                # Добавляем дополнительную проверку состояния сессии
+                if self.session.closed:
+                    logger.error("Session closed unexpectedly during retry")
+                    return None
+                    
                 async with self.session.get(
                     url,
                     proxy=self.proxy_url if self.proxy_url else None,
@@ -84,7 +94,7 @@ class AsyncRSSParser:
                     
             except RuntimeError as e:
                 if "Session is closed" in str(e):
-                    logger.critical("Session is closed! Recreate the session outside the parser")
+                    logger.critical("Session closed during request processing")
                     return None
                 else:
                     self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
