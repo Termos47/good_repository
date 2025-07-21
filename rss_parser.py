@@ -31,12 +31,14 @@ class AsyncRSSParser:
     def __init__(self, session: aiohttp.ClientSession, proxy_url: Optional[str] = None):
         self.session = session
         self.proxy_url = proxy_url
-        self.timeout = aiohttp.ClientTimeout(total=15)
+        self.timeout = aiohttp.ClientTimeout(total=20, sock_read=15)  # Увеличим общий таймаут и добавим отдельный для чтения
         self.semaphore = asyncio.Semaphore(5)
         self.executor = ProcessPoolExecutor(max_workers=2)
         self.config = config #===================================================================================================================================
-        self.feed_status = {}  # Словарь для хранения состояния лент
-        self.feed_errors = {}  # Словарь для подсчета ошибок по URL
+        self.feed_status = {}
+        self.feed_errors = {}
+        self.max_retries = 3  # Максимальное количество попыток
+        self.retry_delay = 0.5  # Задержка между попытками в секундах
 
     def set_feed_status(self, url: str, active: bool):
         """Устанавливает статус активности для RSS-ленты"""
@@ -49,29 +51,46 @@ class AsyncRSSParser:
             logger.info(f"RSS status reset for {url}")
 
     async def fetch_feed(self, url: str) -> Optional[Dict[str, Any]]:
-        """Асинхронно загружает и парсит RSS-ленту"""
+        """Асинхронно загружает и парсит RSS-ленту с повторными попытками"""
         if not self.feed_status.get(url, True):
             return None
+
         logger.info(f"Fetching RSS feed: {url}")
-        try:
-            async with self.session.get(
-                url,
-                proxy=self.proxy_url if self.proxy_url else None,
-                timeout=self.timeout,
-                headers={'User-Agent': 'RSSBot/1.0'}
-            ) as response:
-                if response.status != 200:
-                    logger.error(f"HTTP error {response.status} for {url}")
+        
+        # Добавляем механизм повторных попыток
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                async with self.session.get(
+                    url,
+                    proxy=self.proxy_url if self.proxy_url else None,
+                    timeout=self.timeout,
+                    headers={'User-Agent': 'RSSBot/1.0'}
+                ) as response:
+                    if response.status != 200:
+                        logger.error(f"HTTP error {response.status} for {url}")
+                        return None
+
+                    content = await response.read()
+                    logger.debug(f"Raw content received for {url}, length: {len(content)} bytes")
+                    return await self._safe_parse_feed(content)
+
+            except aiohttp.ClientOSError as e:
+                # Обрабатываем только конкретную SSL-ошибку
+                if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e) and attempt < self.max_retries:
+                    logger.warning(f"SSL error detected, retrying ({attempt}/{self.max_retries}) for {url}")
+                    await asyncio.sleep(self.retry_delay * attempt)
+                else:
+                    # Для других ошибок или последней неудачной попытки
+                    self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
+                    logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
                     return None
-
-                content = await response.read()
-                logger.debug(f"Raw content received for {url}, length: {len(content)} bytes")
-                return await self._safe_parse_feed(content)
-
-        except Exception as e:
-            self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
-            logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
-            return None
+                    
+            except Exception as e:
+                self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
+                logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
+                return None
+        
+        return None  # Достигнуто только при исчерпании попыток
         
     def get_error_count(self, url: str) -> int:
         """Возвращает количество ошибок для указанного URL"""
