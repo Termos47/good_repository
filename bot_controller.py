@@ -509,36 +509,54 @@ class BotController:
         self.stats['min_feed_time'] = min(self.stats['min_feed_time'], cycle_time)
 
     async def _process_single_post(self, post: Union[Dict, str]) -> bool:
-        """Оптимизированная обработка поста"""
+        """Оптимизированная обработка поста с требованием изображения"""
         image_path = None
         try:
             # 1. Нормализация поста
             normalized_post = self._normalize_post(post)
             if not normalized_post:
+                logger.debug("Пост не может быть нормализован")
                 return False
 
             # 2. Генерация ID
             post_id = self._generate_post_id(normalized_post)
             normalized_post['post_id'] = post_id
             original_title = normalized_post.get('title', '')[:50]
-            logger.debug("🆔 Обработка поста: %s", original_title)
+            logger.debug(f"🆔 Обработка поста: {original_title}")
 
             # 3. Обработка контента
             processed_content = await self._process_post_content(normalized_post)
             if processed_content is None:
+                logger.debug("Контент поста не обработан")
                 return False
 
-            # 4. Получение изображения
+            # 4. Получение изображения (только оригинальное, без генерации)
+            image_path = None
             if self.config.IMAGE_SOURCE != 'none':
-                try:
-                    image_path = await self._get_post_image(normalized_post)
-                    if not image_path and self.config.IMAGE_SOURCE == 'required':
-                        return False
-                except Exception:
-                    if self.config.IMAGE_SOURCE == 'required':
-                        return False
+                # Пытаемся получить изображение из RSS или HTML
+                if normalized_post.get('image_url'):
+                    image_path = await self._download_image(
+                        normalized_post['image_url'], 
+                        normalized_post['post_id']
+                    )
+                
+                # Если не нашли в RSS, парсим страницу
+                if not image_path and normalized_post.get('link'):
+                    image_url = await self.rss_parser.extract_primary_image(
+                        normalized_post['link']
+                    )
+                    if image_url:
+                        image_path = await self._download_image(
+                            image_url, 
+                            normalized_post['post_id']
+                        )
+            
+            # 5. Критическая проверка: изображение обязательно!
+            if not image_path:
+                logger.info(f"🚫 Пропуск поста: изображение не найдено {original_title}")
+                return False
 
-            # 5. Отправка в Telegram
+            # 6. Отправка в Telegram
             processed_title = processed_content.get('title', '')[:50]
             success = await self._send_post_to_telegram(
                 processed_content, 
@@ -548,21 +566,22 @@ class BotController:
             
             if success:
                 self._update_stats_after_post(normalized_post)
-                logger.info("✅ Пост отправлен: %s", processed_title)
+                logger.info(f"✅ Пост отправлен: {processed_title}")
                 return True
             return False
 
         except Exception as e:
-            logger.error("⚠️ Ошибка обработки: %s", str(e))
+            logger.error(f"⚠️ Ошибка обработки: {str(e)}", exc_info=True)
             return False
             
         finally:
-            # Очистка временных файлов
+            # Очистка временных файлов изображения
             if image_path and os.path.exists(image_path):
                 try:
                     os.unlink(image_path)
-                except OSError:
-                    pass
+                    logger.debug(f"Временный файл изображения удален: {image_path}")
+                except OSError as e:
+                    logger.warning(f"Ошибка удаления изображения: {str(e)}")
 
     def _generate_content_hash(self, post: Dict) -> str:
         """Генерация MD5 хеша контента поста"""
