@@ -25,7 +25,11 @@ class AsyncRSSParser:
         'main img',
         'figure img',
         'picture source',
-        '[itemprop="image"]'
+        '[itemprop="image"]',
+        '.content img',  # Добавлено для Хабра
+        '.article img',  # Общие селекторы
+        '.post__body img',  # Специально для Хабра
+        '.story__content img'  # Для lenta.ru
     ]
 
     def __init__(
@@ -218,38 +222,81 @@ class AsyncRSSParser:
         return entries
 
     def _extract_image_from_html(self, html_content: str, base_url: str) -> Optional[str]:
-        """Извлекает первую подходящую картинку из HTML-описания"""
+        """Улучшенный поиск изображений в HTML-контенте"""
         if not html_content:
             return None
 
         try:
-            # Расширенные шаблоны для поиска изображений
-            patterns = [
-                r'<img[^>]+src="([^">]+)"',
-                r'<meta[^>]+property="og:image"[^>]+content="([^">]+)"',
-                r'<meta[^>]+name="twitter:image"[^>]+content="([^">]+)"',
-                r'<source[^>]+srcset="([^">]+)"',
-                r'<link[^>]+rel="image_src"[^>]+href="([^">]+)"'
+            soup = BeautifulSoup(html_content, 'html.parser')
+            candidate_images = []
+            
+            # Расширенные селекторы для популярных платформ
+            selectors = [
+                'img',  # Все изображения
+                'picture source[srcset]',
+                '[data-src]',  # Lazy-loaded
+                '.post-content img',
+                '.article-body img',
+                '.content img',
+                '.post__body img',  # Специфично для Хабра
+                '.story__content img'  # Lenta.ru
             ]
-
-            for pattern in patterns:
-                img_match = re.search(pattern, html_content)
-                if img_match:
-                    image_url = img_match.group(1)
-
-                    # Убираем параметры из URL (если есть)
-                    clean_url = re.sub(r'\?.*$', '', image_url)
-
-                    # Пропускаем маленькие или неявные изображения
-                    if any(x in clean_url for x in ['pixel', 'icon', 'logo', 'spacer', 'ad']):
+            
+            for selector in selectors:
+                for element in soup.select(selector):
+                    src = self._get_image_src(element)
+                    if not src:
                         continue
-
-                    # Преобразуем относительные пути
-                    return self._normalize_image_url(clean_url, base_url)
+                        
+                    normalized_url = self._normalize_image_url(src, base_url)
+                    if not normalized_url:
+                        continue
+                        
+                    # Проверка на релевантность
+                    if self._is_relevant_image(element, normalized_url):
+                        candidate_images.append(normalized_url)
+            
+            # Возвращаем первое релевантное изображение
+            return candidate_images[0] if candidate_images else None
+            
         except Exception as e:
-            logger.error(f"HTML image extraction error: {str(e)}")
+            logger.debug(f"HTML content image extraction error: {str(e)}")
+            return None
 
+    @staticmethod
+    def _get_image_src(element: Tag) -> Optional[str]:
+        """Извлекает URL из различных атрибутов"""
+        for attr in ['src', 'srcset', 'data-src', 'data-lazy-src']:
+            if attr in element.attrs:
+                value = element[attr]
+                if isinstance(value, list):
+                    value = value[0]
+                return value.split()[0] if ' ' in value else value
         return None
+
+    @staticmethod
+    def _is_relevant_image(element: Tag, img_url: str) -> bool:
+        """Определяет, является ли изображение релевантным"""
+        # Фильтр по URL
+        if any(bad in img_url.lower() for bad in ['pixel', 'icon', 'logo', 'spacer', 'ad', 'button', 'border']):
+            return False
+            
+        # Фильтр по CSS-классам
+        classes = element.get('class', [])
+        if any(bad in cls.lower() for cls in classes for bad in ['icon', 'logo', 'ad', 'thumb', 'mini']):
+            return False
+            
+        # Фильтр по размеру (если указан)
+        width = element.get('width')
+        height = element.get('height')
+        try:
+            if width and height:
+                if int(width) < 300 or int(height) < 200:
+                    return False
+        except ValueError:
+            pass
+            
+        return True
 
     async def extract_primary_image(self, url: str) -> Optional[str]:
         """Извлекает главное изображение со страницы с повторными попытками"""
@@ -304,7 +351,9 @@ class AsyncRSSParser:
         return None
 
     def _find_content_image(self, soup: BeautifulSoup, base_url: str) -> Optional[str]:
-        """Ищет изображение в основном контенте"""
+        """Ищет изображение в основном контенте с приоритетом по положению и размеру"""
+        candidate_images = []
+        
         for selector in self.CONTENT_SELECTORS:
             for img in soup.select(selector):
                 if not isinstance(img, Tag):
@@ -312,10 +361,51 @@ class AsyncRSSParser:
 
                 img_src = img.get('src') or img.get('srcset', '')
                 img_src = str(img_src).split()[0] if img_src else ''
-
+                
                 if img_src and self._is_valid_image(img, img_src):
-                    return self._normalize_image_url(img_src, base_url)
-        return None
+                    normalized_url = self._normalize_image_url(img_src, base_url)
+                    if not normalized_url:
+                        continue
+                        
+                    # Оценка релевантности изображения
+                    relevance = self._image_relevance_score(img, normalized_url)
+                    candidate_images.append((relevance, normalized_url))
+        
+        if not candidate_images:
+            return None
+        
+        # Сортируем по релевантности (высший балл - первый)
+        candidate_images.sort(key=lambda x: x[0], reverse=True)
+        return candidate_images[0][1]
+
+    @staticmethod
+    def _image_relevance_score(img_tag: Tag, img_url: str) -> int:
+        """Рассчитывает балл релевантности изображения"""
+        score = 0
+        
+        # Бонус за специальные атрибуты
+        if 'data-large-image' in img_tag.attrs:
+            score += 50
+            
+        # Бонус за ключевые слова в URL
+        keywords = ['main', 'featured', 'hero', 'cover', 'primary']
+        if any(kw in img_url.lower() for kw in keywords):
+            score += 30
+        
+        # Бонус за размеры (если указаны)
+        try:
+            width = int(img_tag.get('width', 0))
+            height = int(img_tag.get('height', 0))
+            area = width * height
+            score += min(area // 1000, 40)  # Макс +40 баллов за большие размеры
+        except:
+            pass
+        
+        # Штраф за социальные иконки
+        if 'social' in img_url.lower() or 'icon' in img_url.lower():
+            score -= 20
+            
+        return score
 
     def _find_fallback_image(self, soup: BeautifulSoup, base_url: str) -> Optional[str]:
         """Резервные методы поиска изображений"""
@@ -482,6 +572,14 @@ class AsyncRSSParser:
                     url = attachment.get('url')
                     if url:
                         return str(url)
+                    
+        # 7. Поиск изображения в HTML-контенте (для Habr и подобных)
+        if hasattr(entry, 'description') and entry.description:
+            description = getattr(entry, 'description', '')
+            base_url = self._get_feed_base_url(entry) or ''
+            image_url = self._extract_image_from_html(description, base_url)
+            if image_url:
+                return image_url
 
         return None
 

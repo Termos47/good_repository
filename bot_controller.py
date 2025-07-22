@@ -607,6 +607,26 @@ class BotController:
         logger.error("Неподдерживаемый тип поста: %s", type(post))
         return None
 
+    def _normalize_image_url(self, url: str, base_url: str) -> str:
+        """Улучшенная нормализация URL изображений"""
+        if not url:
+            return ""
+        
+        # Исправление относительных путей
+        if url.startswith('//'):
+            return f'https:{url}'
+        if url.startswith('/'):
+            parsed_base = urlparse(base_url)
+            return f"{parsed_base.scheme}://{parsed_base.netloc}{url}"
+        
+        # Исправление протокола
+        if url.startswith('http:/') and not url.startswith('http://'):
+            url = url.replace('http:/', 'http://')
+        if url.startswith('https:/') and not url.startswith('https://'):
+            url = url.replace('https:/', 'https://')
+        
+        return url
+
     def _generate_post_id(self, post: Dict) -> str:
         """Генерация уникального ID на основе стабильных данных"""
         stable_data = f"{post.get('link', '')}{post.get('title', '')}"
@@ -777,10 +797,12 @@ class BotController:
             if post.get('image_url'):
                 image_url = post['image_url']
                 
-            # 2. Если нет - парсим страницу
-            if not image_url and post.get('link'):
-                image_url = await self.rss_parser.extract_primary_image(post['link'])
-                
+            # 2. Парсим HTML контент для поиска изображений внутри новости
+            if not image_url and post.get('description'):
+                image_url = await self._find_image_in_html_content(
+                    post['description'], 
+                    post.get('link', '')
+                )
             # 3. Скачиваем найденное изображение
             if image_url:
                 return await self._download_image(image_url, post['post_id'])
@@ -858,6 +880,37 @@ class BotController:
             logger.debug(f"HTML parsing error: {str(e)}")
             return None
 
+    async def _find_image_in_html_content(self, html_content: str, base_url: str) -> Optional[str]:
+        """Специализированный поиск изображений внутри HTML-контента"""
+        if not html_content:
+            return None
+
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Поиск контентных изображений с приоритетом
+            content_images = []
+            for img in soup.find_all('img'):
+                src = img.get('src', '')
+                if not src:
+                    continue
+                    
+                # Пропускаем явно нерелевантные изображения
+                if any(bad in src.lower() for bad in ['pixel', 'icon', 'logo', 'spacer', 'ad']):
+                    continue
+                    
+                normalized_url = self._normalize_image_url(src, base_url)
+                if not normalized_url:
+                    continue
+                    
+                content_images.append(normalized_url)
+            
+            # Возвращаем первое подходящее изображение из контента
+            return content_images[0] if content_images else None
+            
+        except Exception as e:
+            logger.debug(f"HTML content image search error: {str(e)}")
+            return None
     def _normalize_image_url(self, url: str, base_url: str) -> str:
         """Нормализация URL изображения"""
         if not isinstance(url, str):
