@@ -12,8 +12,11 @@ class AsyncYandexGPT:
     def __init__(self, config, session: aiohttp.ClientSession):
         self.config = config
         self.session = session
-        self.active = bool(config.YANDEX_API_KEY) and config.ENABLE_YAGPT
-
+        
+        # Проверяем состояние сессии при инициализации
+        session_ok = not session.closed if session else False
+        self.active = bool(config.YANDEX_API_KEY) and config.ENABLE_YAGPT and session_ok
+        
         # Инициализация статистики
         self.stats = {
             'yagpt_used': 0,
@@ -43,6 +46,12 @@ class AsyncYandexGPT:
     def is_available(self) -> bool:
         """Проверяет, доступен ли сервис в текущий момент"""
         if not self.active:
+            return False
+            
+        # Критическая проверка: сессия закрыта?
+        if self.session is None or self.session.closed:
+            logger.warning("Session is closed, disabling YandexGPT")
+            self.active = False
             return False
             
         # Более строгие ограничения для Pro-модели
@@ -86,6 +95,12 @@ class AsyncYandexGPT:
             return None
 
         try:
+            # Проверка состояния сессии перед использованием
+            if self.session.closed:
+                logger.error("Session is closed, cannot make request")
+                self.active = False
+                return None
+
             # Подсчет токенов (простая оценка)
             tokens = len(title.split()) + len(description.split())
 
@@ -165,6 +180,13 @@ class AsyncYandexGPT:
                 if parsed_response:
                     self.stats['yagpt_used'] += 1
                     self.consecutive_errors = 0  # Сброс счетчика ошибок
+                    
+                    # Проверка качества ответа
+                    if self.is_low_quality_response(parsed_response['description']):
+                        logger.warning("Low quality response detected")
+                        self.stats['yagpt_errors'] += 1
+                        return None
+                        
                     return parsed_response
                 
                 logger.warning("Failed to parse YandexGPT response")
@@ -174,6 +196,19 @@ class AsyncYandexGPT:
         except asyncio.TimeoutError:
             logger.error("Yandex GPT request timeout")
             self._handle_error(408, "Timeout", {})
+            return None
+        except RuntimeError as e:
+            if "Session is closed" in str(e):
+                logger.critical("Session closed during request! Disabling service.")
+                self.active = False
+                self._handle_error(500, "Session closed", {})
+            else:
+                logger.error(f"Runtime error in YandexGPT: {str(e)}")
+                self._handle_error(500, str(e), {})
+            return None
+        except aiohttp.ClientConnectionError as e:
+            logger.error(f"Connection error: {str(e)}")
+            self._handle_error(503, "Connection error", {})
             return None
         except Exception as e:
             logger.error(f"Yandex GPT enhancement error: {str(e)}", exc_info=True)
