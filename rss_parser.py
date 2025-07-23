@@ -334,6 +334,39 @@ class AsyncRSSParser:
                 return None
         
         return None
+    
+    async def extract_all_images(self, url: str) -> List[str]:
+        """Извлекает все изображения со страницы с глубоким анализом контента"""
+        try:
+            async with self.session.get(url, timeout=self.timeout) as response:
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+
+                # Расширенные селекторы для всех возможных мест с изображениями
+                selectors = [
+                    'img',                          # Все изображения
+                    'picture source[srcset]',
+                    '[data-src]',
+                    '.article-content img',
+                    '.post-content img',
+                    '.content img',
+                    '[itemprop="image"]',
+                    'figure img',
+                    'div[class*="image"] img'
+                ]
+
+                images = []
+                for selector in selectors:
+                    for element in soup.select(selector):
+                        img_url = self._get_image_url(element, url)
+                        if img_url and img_url not in images:
+                            images.append(img_url)
+                
+                return images
+
+        except Exception as e:
+            logger.error(f"Error extracting images from {url}: {str(e)}")
+            return []
 
     def _find_meta_image(self, soup: BeautifulSoup) -> Optional[str]:
         """Ищет изображение в мета-тегах"""
