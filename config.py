@@ -316,7 +316,7 @@ class Config:
 
         self.CHECK_INTERVAL: int = self.get_env_var('CHECK_INTERVAL', default=300, var_type=int)
         self.MAX_ENTRIES_HISTORY: int = self.get_env_var('MAX_ENTRIES_HISTORY', default=1000, var_type=int)
-        self.RSS_URLS = self.get_list("RSS_URLS", ['https://www.interfax.ru/rss.asp'])
+        self.RSS_URLS = self.get_list("RSS_URLS", [''])
         # Проверка обязательных параметров
         if not self.RSS_URLS:
             logger.critical("RSS_URLS is required in .env file")
@@ -360,9 +360,9 @@ class Config:
         
         # Параметры контента
         self.MIN_TITLE_LENGTH: int = self.get_env_var('MIN_TITLE_LENGTH', default=0, var_type=int)
-        self.MAX_TITLE_LENGTH: int = self.get_env_var('MAX_TITLE_LENGTH', default=150, var_type=int)
+        self.MAX_TITLE_LENGTH: int = self.get_env_var('MAX_TITLE_LENGTH', default=1500, var_type=int)
         self.MIN_DESC_LENGTH: int = self.get_env_var('MIN_DESC_LENGTH', default=0, var_type=int)
-        self.MAX_DESC_LENGTH: int = self.get_env_var('MAX_DESC_LENGTH', default=1000, var_type=int)
+        self.MAX_DESC_LENGTH: int = self.get_env_var('MAX_DESC_LENGTH', default=10000, var_type=int)
 
         # Параметры изображений
         self.ENABLE_IMAGE_GENERATION = self.get_env_var('ENABLE_IMAGE_GENERATION', default=True, var_type=bool)
