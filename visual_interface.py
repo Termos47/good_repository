@@ -388,8 +388,8 @@ class UIBuilder:
     
     async def cancel_general_edit(self, user_id: int) -> None:
         """Сбрасывает состояние редактирования общих настроек"""
-        if user_id in self.general_edit_states:
-            del self.general_edit_states[user_id]
+        if user_id in self.user_general_editing_states:
+            del self.user_general_editing_states[user_id]
         logger.debug(f"Сброшено состояние редактирования для {user_id}")
     
     async def cancel_ai_edit(self, user_id: int) -> None:
