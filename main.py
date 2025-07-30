@@ -142,10 +142,10 @@ def setup_logging(debug_mode: bool = False) -> None:
     for lib in ['asyncio', 'aiohttp', 'PIL']:
         logging.getLogger(lib).setLevel(logging.WARNING)
 
-async def test_bot_commands(bot: AsyncTelegramBot, owner_id: int):
+async def test_bot_commands(telegram_bot: AsyncTelegramBot, owner_id: int):
     """Проверка возможности отправки сообщений"""
     try:
-        await bot.bot.send_message(
+        await telegram_bot.bot.send_message(  # Используем telegram_bot вместо bot
             chat_id=owner_id,
             text="🤖 Бот успешно запущен и готов к работе!",
             parse_mode="HTML"
@@ -223,7 +223,8 @@ async def run_bot():
         yandex_gpt = AsyncYandexGPT(config, session)
         image_generator = AsyncImageGenerator(config)
         logger.info("All components initialized")
-        
+        internet_check_task = asyncio.create_task(check_internet_connection(session))
+
         # Создание контроллера
         controller = BotController(
             config=config,
@@ -236,7 +237,7 @@ async def run_bot():
         logger.info("Bot controller created")
         
         # Передаем контроллер в Telegram бота
-        telegram_bot.controller = controller
+        telegram_bot.set_controller(controller)
         logger.info("Controller linked to Telegram bot")
         
         # Добавляем обработчик логов для отправки ошибок в Telegram
@@ -380,6 +381,16 @@ async def run_bot():
         
         logger.info("===== ASYNC BOT STOPPED =====")
 
+async def check_internet_connection(session):
+    while True:
+        try:
+            async with session.get("https://google.com", timeout=10) as resp:
+                if resp.status != 200:
+                    logger.warning("Интернет соединение нестабильно")
+        except Exception:
+            logger.error("Нет интернет соединения!")
+        await asyncio.sleep(60)
+        
 if __name__ == "__main__":
     # Создаем новый цикл событий
     loop = asyncio.new_event_loop()

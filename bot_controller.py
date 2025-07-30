@@ -10,7 +10,8 @@ import aiohttp
 import re
 import concurrent.futures
 import psutil
-from datetime import datetime
+from datetime import datetime, timedelta
+from datetime import time as time_class
 from typing import Dict, List, Optional, Tuple, Any, Union
 from urllib.parse import urlparse
 from PIL import Image
@@ -36,6 +37,16 @@ class BotController:
         self.REQUIRE_IMAGE = True  # True - требовать изображение, False - разрешать посты без изображений
         self._validate_config()
         self.hourly_stats = {f"hour_{h}": 0 for h in range(24)}
+
+        self.publication_mode = config.PUBLICATION_MODE
+        self.min_delay = config.MIN_DELAY_BETWEEN_POSTS
+        self.publication_schedule = config.PUBLICATION_SCHEDULE
+        self.next_scheduled_time = None
+        
+        if self.publication_mode == 'schedule':
+            self._calculate_next_scheduled_time()
+        
+        logger.info(f"Настройки публикации: mode={self.publication_mode}, delay={self.min_delay}s, schedule={self.publication_schedule}")
         
         # Инициализация логгера
         self.logger = logging.getLogger('bot.controller')
@@ -310,6 +321,62 @@ class BotController:
         except Exception as e:
             logger.error(f"Task cleanup failed: {str(e)}")
 
+    def _calculate_next_scheduled_time(self):
+        """Вычисляет следующее время публикации на основе расписания"""
+        now = datetime.now()
+        current_time = now.time()
+        
+        # Находим ближайшее будущее время в расписании
+        next_time = None
+        for t in self.publication_schedule:
+            if t > current_time:
+                next_time = t
+                break
+        
+        if next_time:
+            self.next_scheduled_time = datetime.combine(now.date(), next_time)
+        else:
+            tomorrow = now + timedelta(days=1)
+            self.next_scheduled_time = datetime.combine(tomorrow.date(), self.publication_schedule[0])
+        
+        logger.info(f"Следующая публикация в: {self.next_scheduled_time.strftime('%H:%M')}")
+
+    async def _wait_for_publication_time(self):
+        """Ожидает подходящего времени для публикации"""
+        if self.publication_mode == 'schedule':
+            now = datetime.now()
+            if not self.next_scheduled_time or now >= self.next_scheduled_time:
+                self._calculate_next_scheduled_time()
+            
+            wait_seconds = (self.next_scheduled_time - now).total_seconds()
+            if wait_seconds > 0:
+                logger.info(f"Ждем {wait_seconds/60:.1f} мин до публикации")
+                await asyncio.sleep(wait_seconds)
+        else:
+            await self._enforce_post_delay()
+
+    # Добавьте эти методы для управления настройками:
+    def set_publication_mode(self, mode):
+        self.publication_mode = mode
+        if mode == 'schedule':
+            self._calculate_next_scheduled_time()
+        logger.info(f"Режим изменен на '{mode}'")
+
+    def set_publication_schedule(self, times):
+        self.publication_schedule = sorted(times)
+        if self.publication_mode == 'schedule':
+            self._calculate_next_scheduled_time()
+        logger.info(f"Новое расписание: {[t.strftime('%H:%M') for t in times]}")
+    
+    def set_publication_mode(self, mode: str):
+        self.publication_mode = mode
+        if mode == 'schedule':
+            self._calculate_next_scheduled_time()
+
+    def set_publication_schedule(self, times: List[time_class]):
+        self.publication_schedule = sorted(times)
+        self._calculate_next_scheduled_time()
+
     async def _rss_processing_loop(self):
         """Основной цикл обработки RSS-лент"""
         last_save_time = time.time()
@@ -408,7 +475,188 @@ class BotController:
             logger.info("📥 Всего загружено %d новых постов из %d лент", total_new, active_feeds)
         
         return new_posts
+    
+    def _load_publication_settings(self, config):
+        """Загружает настройки публикации из конфига"""
+        try:
+            # Режим публикации (delay/schedule)
+            self.publication_mode = os.getenv('PUBLICATION_MODE', 'delay').lower()
+            if self.publication_mode not in ['delay', 'schedule']:
+                self.publication_mode = 'delay'
+                logger.warning("Некорректный PUBLICATION_MODE, установлен режим 'delay'")
 
+            # Минимальная задержка между постами (сек)
+            self.min_delay = int(os.getenv('MIN_DELAY_BETWEEN_POSTS', 300))
+            
+            # Часы публикации (для режима schedule)
+            schedule_hours = os.getenv('PUBLICATION_SCHEDULE_HOURS', '9,12,18')
+            self.publication_schedule = sorted(list({int(h) for h in schedule_hours.split(',') if h.isdigit() and 0 <= int(h) <= 23}))
+            if not self.publication_schedule:
+                self.publication_schedule = [9, 12, 18]
+                logger.warning("Некорректное PUBLICATION_SCHEDULE_HOURS, установлено 9,12,18")
+
+            # Время следующей публикации (вычисляется автоматически)
+            self.next_scheduled_time = None
+            
+            logger.info(f"Настройки публикации загружены: mode={self.publication_mode}, delay={self.min_delay}s, schedule={self.publication_schedule}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка загрузки настроек публикации: {str(e)}")
+            # Устанавливаем значения по умолчанию
+            self.publication_mode = 'delay'
+            self.min_delay = 300
+            self.publication_schedule = [9, 12, 18]
+    
+    def save_publication_settings(self):
+        """Сохраняет текущие настройки публикации в .env файл"""
+        try:
+            with open('.env', 'r+') as f:
+                lines = f.readlines()
+                f.seek(0)
+                
+                # Обновляем или добавляем параметры
+                updated = False
+                new_lines = []
+                
+                for line in lines:
+                    if line.startswith('PUBLICATION_MODE='):
+                        new_lines.append(f'PUBLICATION_MODE={self.publication_mode}\n')
+                        updated = True
+                    elif line.startswith('MIN_DELAY_BETWEEN_POSTS='):
+                        new_lines.append(f'MIN_DELAY_BETWEEN_POSTS={self.min_delay}\n')
+                        updated = True
+                    elif line.startswith('PUBLICATION_SCHEDULE_HOURS='):
+                        new_lines.append(f'PUBLICATION_SCHEDULE_HOURS={",".join(map(str, self.publication_schedule))}\n')
+                        updated = True
+                    else:
+                        new_lines.append(line)
+                
+                # Если параметров не было в файле - добавляем
+                if not updated:
+                    new_lines.extend([
+                        f'\n# Publication settings\n',
+                        f'PUBLICATION_MODE={self.publication_mode}\n',
+                        f'MIN_DELAY_BETWEEN_POSTS={self.min_delay}\n',
+                        f'PUBLICATION_SCHEDULE_HOURS={",".join(map(str, self.publication_schedule))}\n'
+                    ])
+                
+                f.writelines(new_lines)
+                f.truncate()
+            
+            logger.info("Настройки публикации сохранены в .env файл")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка сохранения настроек публикации: {str(e)}")
+            return False
+    
+    def get_publication_settings(self) -> dict:
+        """Возвращает текущие настройки публикации"""
+        return {
+            'mode': self.publication_mode,
+            'delay': self.min_delay,
+            'schedule': [t.strftime('%H:%M') for t in self.publication_schedule]
+        }
+    
+    async def update_publication_settings(self, mode: str, schedule: list = None, delay: int = None):
+        """Обновляет настройки публикации с исправлениями"""
+        if mode not in ['schedule', 'delay']:
+            raise ValueError("Недопустимый режим публикации")
+        
+        self.publication_mode = mode
+        
+        try:
+            if mode == 'schedule':
+                if not schedule:
+                    raise ValueError("Для режима расписания необходимо указать schedule")
+                
+                # Обработка разных форматов расписания
+                if all(isinstance(t, time_class) for t in schedule):
+                    time_objects = schedule
+                else:
+                    time_objects = [datetime.strptime(t.strip(), '%H:%M').time() for t in schedule if t.strip()]
+                
+                self.publication_schedule = sorted(time_objects)
+                self._calculate_next_scheduled_time()
+            else:
+                if delay is None:
+                    raise ValueError("Для режима задержки необходимо указать delay")
+                self.min_delay = delay
+            
+            # Сохранение в конфиг
+            self.config.PUBLICATION_MODE = mode
+            self.config.MIN_DELAY_BETWEEN_POSTS = self.min_delay
+            
+            if mode == 'schedule':
+                schedule_str = ','.join([t.strftime('%H:%M') for t in self.publication_schedule])
+                self.config.PUBLICATION_SCHEDULE = schedule_str
+                self.config.save_to_env_file("PUBLICATION_SCHEDULE", schedule_str)
+            
+            # Всегда сохраняем основные параметры
+            self.config.save_to_env_file("PUBLICATION_MODE", mode)
+            self.config.save_to_env_file("MIN_DELAY_BETWEEN_POSTS", str(self.min_delay))
+            
+            logger.info(f"Настройки публикации обновлены: mode={mode}, delay={self.min_delay}, schedule={getattr(self, 'publication_schedule', [])}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Ошибка обновления настроек публикации: {str(e)}", exc_info=True)
+            raise
+        
+        logger.info(f"Настройки публикации обновлены: mode={mode}, delay={self.min_delay}, schedule={self.publication_schedule}")
+
+    def set_publication_mode(self, mode: str, **params) -> None:
+        """Установка режима публикации с сохранением в .env"""
+        valid_modes = ['delay', 'schedule']
+        if mode not in valid_modes:
+            raise ValueError(f"Недопустимый режим. Допустимые значения: {valid_modes}")
+        
+        # Основная установка режима
+        self.publication_mode = mode
+        logger.info(f"Режим публикации изменен на '{mode}'")
+        
+        # Обработка параметров для разных режимов
+        if mode == 'delay':
+            if 'delay_seconds' in params:
+                self.min_delay = params['delay_seconds']
+        elif mode == 'schedule':
+            # Обновление расписания если переданы параметры
+            if 'schedule_hours' in params:
+                raw_hours = params['schedule_hours']
+                processed_hours = {int(h) for h in raw_hours if 0 <= int(h) <= 23}
+                self.publication_schedule = sorted(processed_hours)
+                
+                # Установка расписания по умолчанию если пусто
+                if not self.publication_schedule:
+                    self.publication_schedule = [9, 12, 18]
+            
+            # Пересчет времени публикации
+            self._calculate_next_scheduled_time()
+        
+        # Сохранение и финальное логирование
+        self.save_publication_settings()
+        logger.info(
+            f"Установлен режим публикации: {self.publication_mode} "
+            f"(delay={self.min_delay}, schedule={self.publication_schedule})"
+        )
+        
+    async def _wait_for_publication_time(self):
+        if self.publication_mode != 'schedule':
+            return
+            
+        now = datetime.now()
+        
+        # Всегда пересчитываем следующее время перед ожиданием
+        self._calculate_next_scheduled_time()
+        
+        wait_seconds = (self.next_scheduled_time - now).total_seconds()
+        
+        if wait_seconds > 0:
+            logger.info(f"Ожидание публикации: {wait_seconds:.1f} сек")
+            await asyncio.sleep(wait_seconds)
+        elif wait_seconds < 0:
+            # Если время публикации уже прошло, пропускаем ожидание
+            logger.warning(f"Время публикации уже прошло: {-wait_seconds:.1f} сек назад")
+        
     async def _process_new_posts(self, posts: List[Dict]):
         """Обработка новых постов с улучшенным логированием"""
         if not posts:
@@ -509,7 +757,6 @@ class BotController:
         self.stats['min_feed_time'] = min(self.stats['min_feed_time'], cycle_time)
 
     async def _process_single_post(self, post: Union[Dict, str]) -> bool:
-        """Оптимизированная обработка поста с требованием изображения"""
         image_path = None
         try:
             # 1. Нормализация поста
@@ -530,10 +777,9 @@ class BotController:
                 logger.debug("Контент поста не обработан")
                 return False
 
-            # 4. Получение изображения (только оригинальное, без генерации)
-            image_path = None
+            # 4. Получение изображения
             if self.config.IMAGE_SOURCE != 'none':
-                # Пытаемся получить изображение из RSS или HTML
+                # Пытаемся получить изображение из RSS
                 if normalized_post.get('image_url'):
                     image_path = await self._download_image(
                         normalized_post['image_url'], 
@@ -556,7 +802,13 @@ class BotController:
                 logger.info(f"🚫 Пропуск поста: изображение не найдено {original_title}")
                 return False
 
-            # 6. Отправка в Telegram
+            # 6. Ожидание времени публикации ПЕРЕД ОТПРАВКОЙ
+            if self.publication_mode == 'schedule':
+                await self._wait_for_publication_time()
+            else:
+                await self._enforce_post_delay()
+
+            # 7. Отправка в Telegram
             processed_title = processed_content.get('title', '')[:50]
             success = await self._send_post_to_telegram(
                 processed_content, 
@@ -662,14 +914,17 @@ class BotController:
         return False
     
     async def _process_post_content(self, post: Dict) -> Optional[Dict[str, str]]:
-        """Обработка контента с жёсткой фильтрацией ИИ-результатов"""
         try:
             title = post.get('title', '')
             description = post.get('description', '')
             
-            # Если контент слишком короткий - сразу пропускаем пост
-            if len(title) < 5 or len(description) < 20:
-                logger.warning("Слишком короткий контент, пропуск поста")
+            # Устанавливаем гибкие пороги проверки
+            MIN_TITLE_LEN = 3  # вместо 5
+            MIN_DESC_LEN = 15  # вместо 20
+            
+            if len(title) < MIN_TITLE_LEN or len(description) < MIN_DESC_LEN:
+                # Обновляем сообщение для точной диагностики
+                logger.warning(f"Короткий контент: title={len(title)}, desc={len(description)}")
                 return None
 
             # Проверяем условия для использования ИИ

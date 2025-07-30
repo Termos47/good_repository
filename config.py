@@ -5,6 +5,8 @@ import logging.config
 from datetime import datetime
 import re
 import shutil
+from datetime import time as time_class
+import time
 import traceback
 from typing import Dict, Any, List, Optional, Tuple, Union
 import sys
@@ -326,6 +328,14 @@ class Config:
             [True] * len(self.RSS_URLS)
         )
 
+        self.PUBLICATION_MODE = os.getenv('PUBLICATION_MODE', 'delay')  # 'delay' или 'schedule'
+        self.MIN_DELAY_BETWEEN_POSTS = int(os.getenv('MIN_DELAY_BETWEEN_POSTS', 300))
+        
+        # Парсинг расписания из строки формата "9:30,12:00,18:45"
+        self.PUBLICATION_SCHEDULE = self._parse_schedule(
+            os.getenv('PUBLICATION_SCHEDULE', '9:00,12:00,18:00')
+        )
+
         # После инициализации RSS_URLS и RSS_ACTIVE
         if len(self.RSS_ACTIVE) != len(self.RSS_URLS):
             self.logger.warning(
@@ -414,7 +424,6 @@ class Config:
         # Принудительные настройки для режима 'original'
         if self.IMAGE_SOURCE == 'original':
             self.IMAGE_FALLBACK = False
-            self.ENABLE_IMAGE_GENERATION = False
             
         if self.DEBUG_MODE:
             self.logger.debug("DEBUG MODE ENABLED", extra={'config': self.to_dict()})
@@ -454,6 +463,28 @@ class Config:
             'MAX_CONCURRENT_IMAGE_TASKS': self.MAX_CONCURRENT_IMAGE_TASKS
         }
 
+    def _parse_schedule(self, schedule_str):
+        """Парсит строку расписания в список объектов time"""
+        times = []
+        for item in schedule_str.split(','):
+            try:
+                item = item.strip()
+                if ':' in item:
+                    hour, minute = map(int, item.split(':'))
+                else:
+                    hour, minute = int(item), 0
+                
+                if 0 <= hour <= 23 and 0 <= minute <= 59:
+                    times.append(time_class(hour=hour, minute=minute))  # Используем алиас
+            except ValueError:
+                continue
+        
+        return sorted(times) if times else [
+            time_class(9, 0), 
+            time_class(12, 0), 
+            time_class(18, 0)
+        ]
+    
     def _normalize_channel_id(self, channel_id: str) -> str:
         """Нормализует ID канала для Telegram API"""
         clean_id = str(channel_id).strip().replace(' ', '').replace('@', '')
@@ -531,6 +562,26 @@ class Config:
                 valid_urls.append(url)
         return valid_urls
     
+
+    def validate_schedule_str(self, schedule_str: str) -> List[str]:
+        """Проверяет и нормализует строку расписания"""
+        times = []
+        for item in schedule_str.split(','):
+            item = item.strip()
+            if not item:
+                continue
+                
+            # Проверяем формат времени
+            if re.match(r"^\d{1,2}:\d{2}$", item):
+                times.append(item)
+            else:
+                raise ValueError(f"Неправильный формат времени: {item}")
+        
+        if not times:
+            raise ValueError("Не указано ни одного времени")
+        
+        return times
+
     def save_rss_settings(self, urls: List[str], active: List[bool]):
         """Сохраняет настройки RSS в .env"""
         self.RSS_URLS = urls

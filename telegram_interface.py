@@ -3,13 +3,13 @@ from collections import deque
 import json
 import os
 import logging
+import re
 import time
-
+from datetime import time as time_class
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from state_manager import StateManager
 from typing import Optional, List, Dict, Any, Union
 from datetime import datetime
-
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands, CallbackQuery, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -100,6 +100,41 @@ class InputValidator:
             
         return value
 
+    @staticmethod
+    def validate_schedule(text: str) -> List[str]:
+        """Валидация формата расписания"""
+        times = []
+        errors = []
+        
+        for part in text.split(','):
+            part = part.strip()
+            if not part:
+                continue
+                
+            # Проверка формата ЧЧ:ММ
+            if re.match(r'^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$', part):
+                times.append(part)
+            else:
+                errors.append(part)
+        
+        if not times:
+            raise ValueError(
+                "Неверный формат расписания\n"
+                "Используйте: ЧЧ:ММ,ЧЧ:ММ,... (например: 9:30,12:00,18:45)"
+            )
+        
+        if errors:
+            raise ValueError(
+                "Некорректные значения времени: " + ", ".join(errors) + "\n"
+                "Формат: ЧЧ:ММ (например: 9:30 или 09:30)"
+            )
+            
+        # Ограничение количества точек
+        if len(times) > 24:
+            raise ValueError("Максимум 24 временных точки")
+            
+        return times
+
 class AsyncTelegramBot:
     def __init__(self, token: str, channel_id: str, config: Config):
         self.token = token
@@ -116,9 +151,13 @@ class AsyncTelegramBot:
 
         # Запуск фоновой задачи очистки
         self.cleanup_task = asyncio.create_task(self._cleanup_pending_inputs())
-        
+        self.dp.message.register(self.handle_set_schedule, Command("set_schedule"))
         self._register_handlers()
     
+    def set_controller(self, controller):
+        """Устанавливает контроллер для обработки команд"""
+        self.controller = controller
+        
     async def setup_commands(self) -> None:
         """Устанавливает меню команд в строке ввода"""
         commands = [
@@ -195,9 +234,20 @@ class AsyncTelegramBot:
         self.dp.message.register(self.handle_param_info, Command("param_info"))
         self.dp.message.register(self.handle_set_all, Command("set_all"))
         self.dp.message.register(self.handle_message)
-        
+        self.dp.message.register(self.handle_set_schedule, Command("set_schedule"))
+        self.dp.message.register(self.handle_set_mode, Command('set_mode'))
         self.dp.callback_query.register(self.handle_callback)
-    
+        self.dp.callback_query.register(self.show_publication_settings, lambda c: c.data == "settings_publication")
+        self.dp.callback_query.register(self.toggle_publication_mode, lambda c: c.data.startswith("set_pub_mode_"))
+        self.dp.callback_query.register(self.handle_edit_schedule, lambda c: c.data == "edit_schedule")
+        self.dp.callback_query.register(self.handle_edit_delay, lambda c: c.data == "edit_delay")
+        self.dp.callback_query.register(self.toggle_publication_mode, lambda c: c.data.startswith("toggle_pub_mode_"))
+        self.dp.callback_query.register(self.show_publication_settings_menu, lambda c: c.data == "publication_settings")
+        self.dp.callback_query.register(self.handle_manage_schedule, lambda c: c.data == "manage_schedule")
+        self.dp.callback_query.register(self.handle_show_schedule, lambda c: c.data == "show_schedule")
+        self.dp.callback_query.register(self.handle_switch_publication_mode, lambda c: c.data == "switch_publication_mode")
+        self.dp.callback_query.register(self.handle_set_publication_mode, lambda c: c.data.startswith("set_mode_"))
+
     async def handle_callback(self, callback: CallbackQuery) -> None:
         """Основной обработчик callback'ов"""
         try:
@@ -463,7 +513,9 @@ class AsyncTelegramBot:
             }.get(param, "числовое значение")
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
                 [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_general")]
+                ]
             ])
             
             await callback.message.answer(
@@ -523,6 +575,186 @@ class AsyncTelegramBot:
             logger.error(f"Ошибка сохранения: {str(e)}")
             await callback.answer("Ошибка сохранения настроек", show_alert=True)
 
+    async def show_publication_settings(
+        self, 
+        target: Union[Message, CallbackQuery], 
+        edit_mode: bool = False
+    ) -> None:
+        """Показывает объединенные настройки публикации и основные"""
+        if not self.controller:
+            await target.answer("Контроллер не подключен")
+            return
+        
+        user_id = target.from_user.id
+        config = self.controller.config
+        controller = self.controller
+        
+        # Получаем текущий режим публикации
+        pub_mode = controller.publication_mode
+        pub_mode_text = "Расписание" if pub_mode == 'schedule' else "Задержка"
+        
+        # Формируем текст в зависимости от режима
+        if pub_mode == 'schedule':
+            schedule_times = ", ".join(
+                [t.strftime("%H:%M") for t in controller.publication_schedule]
+            )
+            settings_text = (
+                f"⏰ <b>Режим публикации:</b> {pub_mode_text}\n"
+                f"<b>Расписание:</b> {schedule_times}\n"
+            )
+        else:
+            settings_text = (
+                f"⏰ <b>Режим публикации:</b> {pub_mode_text}\n"
+                f"<b>Мин. задержка:</b> {config.MIN_DELAY_BETWEEN_POSTS} сек\n"
+            )
+        
+        # Добавляем основные настройки
+        settings_text += (
+            f"\n⚙️ <b>Основные настройки</b>\n"
+            f"• Интервал проверки: {config.CHECK_INTERVAL} сек\n"
+            f"• Макс. постов за цикл: {config.MAX_POSTS_PER_CYCLE}\n"
+            f"• Постов в час: {config.POSTS_PER_HOUR}\n"
+        )
+        
+        # Создаем клавиатуру
+        builder = InlineKeyboardBuilder()
+        
+        # Кнопка смены режима публикации
+        new_mode = 'schedule' if pub_mode == 'delay' else 'delay'
+        new_mode_text = "Расписание" if new_mode == 'schedule' else "Задержка"
+        builder.button(
+            text=f"🔄 Сменить на {new_mode_text}", 
+            callback_data=f"toggle_pub_mode_{new_mode}"
+        )
+        
+        # Кнопки редактирования параметров в зависимости от режима
+        if pub_mode == 'schedule':
+            builder.button(
+                text="✏️ Изменить расписание", 
+                callback_data="edit_schedule"
+            )
+        else:
+            builder.button(
+                text="✏️ Изменить задержку", 
+                callback_data="edit_delay"
+            )
+        
+        # Другие основные настройки
+        builder.button(
+            text="⚙️ Интервал проверки", 
+            callback_data="edit_general_check_interval"
+        )
+        builder.button(
+            text="📊 Макс. постов/цикл", 
+            callback_data="edit_general_max_posts_per_cycle"
+        )
+        builder.button(
+            text="🚀 Постов в час", 
+            callback_data="edit_general_posts_per_hour"
+        )
+        
+        builder.adjust(1)  # По одной кнопке в строке
+        builder.row(*[
+            InlineKeyboardButton(text="◀️ Назад", callback_data="settings"),
+            InlineKeyboardButton(text="💾 Сохранить", callback_data="save_general_settings")
+        ])
+        
+        keyboard = builder.as_markup()
+        
+        # Отправка/редактирование сообщения
+        if isinstance(target, CallbackQuery):
+            try:
+                await target.message.edit_text(
+                    text=settings_text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+            except Exception:
+                await self.bot.send_message(
+                    chat_id=target.message.chat.id,
+                    text=settings_text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+        else:
+            await target.answer(
+                text=settings_text,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+    async def toggle_publication_mode(self, callback: CallbackQuery) -> None:
+        """Переключает режим публикации между задержкой и расписанием"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        # Извлекаем новый режим из callback data
+        new_mode = callback.data.replace("toggle_pub_mode_", "")
+        
+        try:
+            # Для режима расписания используем текущее расписание
+            schedule = None
+            if new_mode == 'schedule':
+                schedule = [t.strftime("%H:%M") for t in self.controller.publication_schedule]
+            
+            # Для режима задержки используем текущую задержку
+            delay = None
+            if new_mode == 'delay':
+                delay = self.controller.min_delay
+            
+            await self.controller.update_publication_settings(new_mode, schedule, delay)
+            await callback.answer(f"✅ Режим изменен на {new_mode}")
+            await self.show_publication_settings(callback)
+        except Exception as e:
+            logger.error(f"Ошибка изменения режима: {str(e)}")
+            await callback.answer(f"❌ Ошибка: {str(e)}")
+    
+    async def handle_edit_schedule(self, callback: CallbackQuery) -> None:
+        """Запрашивает ввод нового расписания"""
+        user_id = callback.from_user.id
+        self.pending_input[user_id] = {
+            'param': 'publication_schedule',
+            'type': 'publication',
+            'chat_id': callback.message.chat.id,
+        }
+        self.pending_input_timeouts[user_id] = time.time() + 300
+        
+        current_schedule = ", ".join(
+            [t.strftime("%H:%M") for t in self.controller.publication_schedule]
+        ) if self.controller else ""
+        
+        await callback.message.answer(
+            f"✏️ Введите новое расписание (формат: ЧЧ:ММ, ЧЧ:ММ, ...)\n"
+            f"Текущее расписание: {current_schedule}\n"
+            "Пример: 9:30, 12:00, 18:45",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_publication")
+            ]])
+        )
+        await callback.answer()
+
+    async def handle_edit_delay(self, callback: CallbackQuery) -> None:
+        """Запрашивает ввод новой задержки"""
+        user_id = callback.from_user.id
+        self.pending_input[user_id] = {
+            'param': 'min_delay_between_posts',
+            'type': 'publication',
+            'chat_id': callback.message.chat.id,
+        }
+        self.pending_input_timeouts[user_id] = time.time() + 300
+        
+        current_delay = self.controller.min_delay if self.controller else ""
+        
+        await callback.message.answer(
+            f"✏️ Введите минимальную задержку между постами (в секундах)\n"
+            f"Текущая задержка: {current_delay} сек\n"
+            "Пример: 300 (или 5m)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_publication")
+            ]])
+        )
+        await callback.answer()
+
     async def cancel_general_edit(self, callback: CallbackQuery) -> None:
         """Отменяет редактирование общих настроек"""
         try:
@@ -548,24 +780,40 @@ class AsyncTelegramBot:
             logger.error(f"Ошибка отмены редактирования: {str(e)}", exc_info=True)
             await callback.answer("⚠️ Ошибка отмены операции")
 
-    async def handle_cancel_edit(self, callback: CallbackQuery, edit_type: str):
-        """Универсальная отмена редактирования"""
+    async def handle_cancel_edit(self, callback: CallbackQuery) -> None:
+        """Универсальная отмена редактирования для всех типов настроек"""
         try:
-            handler = getattr(self, f"cancel_{edit_type}_edit", None)
-            if handler and callable(handler):
-                await handler(callback)
-            else:
-                # Стандартная обработка при отсутствии специфического обработчика
-                user_id = callback.from_user.id
-                if user_id in self.pending_input:
-                    del self.pending_input[user_id]
-                if user_id in self.pending_input_timeouts:
-                    del self.pending_input_timeouts[user_id]
+            user_id = callback.from_user.id
+            
+            # Удаляем состояние ожидания ввода
+            if user_id in self.pending_input:
+                input_data = self.pending_input[user_id]
+                del self.pending_input[user_id]
                 
-                await self.send_main_menu(user_id, callback.message.chat.id)
-                await callback.answer("❌ Операция отменена")
+                # Определяем, куда вернуть пользователя после отмены
+                if input_data.get('type') == 'publication':
+                    # Возвращаем в меню публикации
+                    await self.show_publication_settings(callback)
+                elif input_data.get('type') == 'ai':
+                    # Возвращаем в настройки AI
+                    await self.show_ai_settings(callback)
+                elif input_data.get('type') == 'general':
+                    # Возвращаем в общие настройки
+                    await self.show_general_settings(callback)
+                else:
+                    # Возвращаем в главное меню
+                    await self.send_main_menu(user_id, callback.message.chat.id)
+            
+            # Очищаем таймауты и счетчики попыток
+            if user_id in self.pending_input_timeouts:
+                del self.pending_input_timeouts[user_id]
+            if user_id in self.pending_input_retries:
+                del self.pending_input_retries[user_id]
+            
+            await callback.answer("❌ Редактирование отменено")
+            
         except Exception as e:
-            logger.error(f"Ошибка универсальной отмены: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка отмены редактирования: {str(e)}", exc_info=True)
             await callback.answer("⚠️ Ошибка отмены операции")
 
     async def edit_ai_settings(self, callback: CallbackQuery) -> None:
@@ -639,7 +887,9 @@ class AsyncTelegramBot:
         self.pending_input_timeouts[user_id] = time.time() + 300
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_ai")]
+            ]
         ])
         
         await callback.message.answer(
@@ -667,7 +917,9 @@ class AsyncTelegramBot:
         self.pending_input_timeouts[user_id] = time.time() + 300
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_ai")]
+            ]
         ])
         
         await callback.message.answer(
@@ -827,7 +1079,7 @@ class AsyncTelegramBot:
 
     async def handle_message(self, message: Message) -> None:
         """Обработчик текстовых сообщений с подтверждением изменений"""
-        if not await self.is_owner(message):
+        if not await self.enforce_owner_access(message):
             return
             
         user_id = message.from_user.id
@@ -840,107 +1092,156 @@ class AsyncTelegramBot:
             param_type = input_data.get('type', 'general')
             
             try:
-                # Удаляем ожидание ввода сразу (чтобы избежать рекурсии)
-                del self.pending_input[user_id]
-                
-                # Валидация в зависимости от типа параметра
-                if param in ['temperature', 'yagpt_temperature']:
-                    value = self.validator.validate_temperature(text)
-                elif param in ['max_tokens', 'yagpt_max_tokens']:
-                    value = self.validator.validate_tokens(text)
-                elif param in ['check_interval', 'min_delay_between_posts']:
-                    value = self.validator.validate_interval(text)
-                elif param in ['enable_yagpt', 'image_fallback']:
-                    value = self.validator.validate_boolean(text)
-                else:
-                    # Общая валидация для числовых параметров
-                    min_val, max_val = 1, 10000
-                    value = self.validator.validate_integer(text, min_val, max_val)
-                    
-                # Обновление параметра
-                if param_type == 'ai':
-                    await self.ui.update_ai_setting(user_id, param, value)
-                    await message.answer(f"✅ Установлено: {param} = {value}")
-                    # Используем универсальный метод
-                    await self.show_ai_settings(message, edit_mode=True)
-                elif param_type == 'general':
-                    await self.ui.update_general_setting(user_id, param, value)
-                    await message.answer(f"✅ Установлено: {param} = {value}")
-                    # Используем универсальный метод
-                    await self.show_general_settings(message, edit_mode=True)
-                    
-                # Сброс счетчика попыток
-                if user_id in self.pending_input_retries:
-                    del self.pending_input_retries[user_id]
-                    
-            except ValueError as e:
-                # Сохраняем контекст для повторной попытки
-                input_data['last_error'] = str(e)
-                self.pending_input[user_id] = input_data
-                
-                # Счетчик попыток
-                retries = self.pending_input_retries.get(user_id, 0) + 1
-                self.pending_input_retries[user_id] = retries
-                
-                if retries >= 3:
-                    await message.answer(f"❌ Слишком много ошибок. Операция отменена.\nОшибка: {str(e)}")
+                    # Удаляем ожидание ввода сразу (чтобы избежать рекурсии)
                     del self.pending_input[user_id]
-                    del self.pending_input_retries[user_id]
+                    
+                    # Обработка параметров публикации
+                    if param_type == 'publication':
+                        if param == 'publication_schedule':
+                            # Валидация расписания
+                            times = self.validator.validate_schedule(text)
+                            
+                            # Конвертация в объекты времени
+                            await self.controller.update_publication_settings(mode='schedule', schedule=times)
+                            
+                            await message.answer(f"✅ Расписание обновлено: {', '.join(times)}")
+                            await self.show_publication_settings(message)
+                            
+                        elif param == 'min_delay_between_posts':
+                            # Валидация задержки
+                            value = self.validator.validate_interval(text)
+                            
+                            # Обновление настроек
+                            await self.controller.update_publication_settings(
+                                mode='delay',
+                                delay=value
+                            )
+                            
+                            await message.answer(f"✅ Задержка обновлена: {value} сек")
+                            await self.show_publication_settings(message)
+                            
+                        # Сброс счетчика попыток
+                        if user_id in self.pending_input_retries:
+                            del self.pending_input_retries[user_id]
+                        return
+                    
+                    # Обработка параметров AI
+                    elif param_type == 'ai':
+                        if param == 'temperature':
+                            value = self.validator.validate_temperature(text)
+                            await self.ui.update_ai_setting(user_id, "temperature", value)
+                            await message.answer(f"✅ Установлено: {param} = {value}")
+                            await self.show_ai_settings(message, edit_mode=True)
+                            
+                        elif param == 'max_tokens':
+                            value = self.validator.validate_tokens(text)
+                            await self.ui.update_ai_setting(user_id, "max_tokens", value)
+                            await message.answer(f"✅ Установлено: {param} = {value}")
+                            await self.show_ai_settings(message, edit_mode=True)
+                            
+                        # Сброс счетчика попыток
+                        if user_id in self.pending_input_retries:
+                            del self.pending_input_retries[user_id]
+                        return
+                    
+                    # Обработка общих параметров
+                    elif param_type == 'general':
+                        if param in ['temperature', 'yagpt_temperature']:
+                            value = self.validator.validate_temperature(text)
+                        elif param in ['max_tokens', 'yagpt_max_tokens']:
+                            value = self.validator.validate_tokens(text)
+                        elif param in ['check_interval', 'min_delay_between_posts']:
+                            value = self.validator.validate_interval(text)
+                        elif param in ['enable_yagpt', 'image_fallback']:
+                            value = self.validator.validate_boolean(text)
+                        else:
+                            # Общая валидация для числовых параметров
+                            min_val, max_val = 1, 10000
+                            value = self.validator.validate_integer(text, min_val, max_val)
+                        
+                        # Обновление параметра
+                        if param_type == 'ai':
+                            await self.ui.update_ai_setting(user_id, param, value)
+                            await self.show_ai_settings(message, edit_mode=True)
+                        elif param_type == 'general':
+                            await self.ui.update_general_setting(user_id, param, value)
+                            await self.show_general_settings(message, edit_mode=True)
+                            
+                        await message.answer(f"✅ Установлено: {param} = {value}")
+                        
+                        # Сброс счетчика попыток
+                        if user_id in self.pending_input_retries:
+                            del self.pending_input_retries[user_id]
+                        
+            except ValueError as e:
+                    # Сохраняем контекст для повторной попытки
+                    input_data['last_error'] = str(e)
+                    self.pending_input[user_id] = input_data
+                    
+                    # Счетчик попыток
+                    retries = self.pending_input_retries.get(user_id, 0) + 1
+                    self.pending_input_retries[user_id] = retries
+                    
+                    if retries >= 3:
+                        await message.answer(f"❌ Слишком много ошибок. Операция отменена.\nОшибка: {str(e)}")
+                        del self.pending_input[user_id]
+                        del self.pending_input_retries[user_id]
+                        return
+                        
+                    # Клавиатура с кнопкой отмены
+                    cancel_data = f"cancel_edit_{param_type}"
+                    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                        [
+                            InlineKeyboardButton(text="↩️ Повторить ввод", callback_data=f"retry_{param}"),
+                            InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_data)
+                        ]
+                    ])
+                    
+                    await message.answer(
+                        f"❌ Ошибка: {str(e)}\n\nПопробуйте еще раз:",
+                        reply_markup=keyboard
+                    )
                     return
                     
-                # Клавиатура с кнопкой отмены
-                keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                    [  # Один ряд с двумя кнопками
-                        InlineKeyboardButton(text="↩️ Повторить ввод", callback_data=f"retry_{param}"),
-                        InlineKeyboardButton(text="❌ Отмена", callback_data=f"cancel_edit_{param_type}")
-                    ]
-                ])
-                
-                await message.answer(
-                    f"❌ Ошибка: {str(e)}\n\nПопробуйте еще раз:",
-                    reply_markup=keyboard
-                )
-                return
-                
             except Exception as e:
-                logger.error(f"Ошибка обработки ввода: {str(e)}")
-                await message.answer("❌ Произошла ошибка при обработке значения")
+                    logger.error(f"Ошибка обработки ввода: {str(e)}")
+                    await message.answer("❌ Произошла ошибка при обработке значения")
+                    return
+            
+            # Обработка добавления RSS
+            if message.reply_to_message and ("rss" in message.reply_to_message.text.lower() or "лент" in message.reply_to_message.text.lower()):
+                url = text
+                if not url.startswith(('http://', 'https://')):
+                    await message.answer("❌ Некорректный URL. Должен начинаться с http:// или https://")
+                    return
+                    
+                if url in self.config.RSS_URLS:
+                    await message.answer("⚠️ Эта RSS-лента уже есть в списке")
+                    return
+                    
+                try:
+                    self.config.RSS_URLS.append(url)
+                    self.config.RSS_ACTIVE.append(True)
+                    self.config.save_to_env_file("RSS_URLS", json.dumps(self.config.RSS_URLS))
+                    self.config.save_to_env_file("RSS_ACTIVE", json.dumps(self.config.RSS_ACTIVE))
+                    
+                    if self.controller:
+                        self.controller.update_rss_state(self.config.RSS_URLS, self.config.RSS_ACTIVE)
+                    
+                    await message.answer(f"✅ RSS-лента успешно добавлена:\n{url}")
+                    
+                    # Показываем обновленный список
+                    if self.controller:
+                        feeds = self.controller.get_rss_status()
+                        text, keyboard = await self.ui.rss_settings_view(feeds)
+                        await message.answer("📋 Обновленный список RSS-лент:", reply_markup=keyboard)
+                except Exception as e:
+                    logger.error(f"Ошибка добавления RSS: {str(e)}")
+                    await message.answer(f"❌ Ошибка при добавлении RSS-ленты:\n{str(e)}")
                 return
-        
-        # Обработка добавления RSS
-        if message.reply_to_message and ("rss" in message.reply_to_message.text.lower() or "лент" in message.reply_to_message.text.lower()):
-            url = text
-            if not url.startswith(('http://', 'https://')):
-                await message.answer("❌ Некорректный URL. Должен начинаться с http:// или https://")
-                return
-                
-            if url in self.config.RSS_URLS:
-                await message.answer("⚠️ Эта RSS-лента уже есть в списке")
-                return
-                
-            try:
-                self.config.RSS_URLS.append(url)
-                self.config.RSS_ACTIVE.append(True)
-                self.config.save_to_env_file("RSS_URLS", json.dumps(self.config.RSS_URLS))
-                self.config.save_to_env_file("RSS_ACTIVE", json.dumps(self.config.RSS_ACTIVE))
-                
-                if self.controller:
-                    self.controller.update_rss_state(self.config.RSS_URLS, self.config.RSS_ACTIVE)
-                
-                await message.answer(f"✅ RSS-лента успешно добавлена:\n{url}")
-                
-                # Показываем обновленный список
-                if self.controller:
-                    feeds = self.controller.get_rss_status()
-                    text, keyboard = await self.ui.rss_settings_view(feeds)
-                    await message.answer("📋 Обновленный список RSS-лент:", reply_markup=keyboard)
-            except Exception as e:
-                logger.error(f"Ошибка добавления RSS: {str(e)}")
-                await message.answer(f"❌ Ошибка при добавлении RSS-ленты:\n{str(e)}")
-            return
-        
-        # Если сообщение не распознано как ввод параметра
-        await self.send_main_menu(user_id, message.chat.id)
+            
+            # Если сообщение не распознано как ввод параметра
+            await self.send_main_menu(user_id, message.chat.id)
         
     async def show_rss_settings(self, callback: CallbackQuery, edit_mode: bool = False):
         """Показывает настройки RSS с возможностью редактирования"""
@@ -1152,7 +1453,9 @@ class AsyncTelegramBot:
                 lines.append(f"{i}. {status_icon} {feed['url'][:50]}...{error_icon}{last_check}")
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [
                 [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="main_menu")]
+                ]
             ])
             
             await message.answer(  # Используем message вместо callback
@@ -1334,6 +1637,280 @@ class AsyncTelegramBot:
             self.config.save_to_env_file(param, str(converted_value))
         except (TypeError, ValueError) as e:
             await message.answer(f"❌ Ошибка: {str(e)}")
+
+    async def handle_set_schedule(self, message: Message) -> None:
+        """Обработчик команды /set_schedule с полной диагностикой"""
+        try:
+            # 1. Проверка прав доступа
+            if not await self.enforce_owner_access(message):
+                return
+            
+            # 2. Проверка наличия контроллера
+            if not self.controller:
+                logger.error("Контроллер не установлен при обработке /set_schedule")
+                await message.answer("❌ Системная ошибка: контроллер не подключен")
+                return
+            
+            # 3. Разбор команды
+            args = message.text.split(maxsplit=1)
+            command_debug = f"Команда: {message.text}\nПользователь: {message.from_user.id}"
+            logger.info(f"Обработка /set_schedule: {command_debug}")
+            
+            # 4. Режим показа текущего расписания
+            if len(args) < 2:
+                current_schedule = ", ".join([t.strftime("%H:%M") for t in self.controller.publication_schedule])
+                await message.answer(
+                    f"⏰ Текущее расписание: {current_schedule}\n\n"
+                    "Для изменения отправьте:\n"
+                    "<code>/set_schedule 9:30,12:00,18:45</code>",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # 5. Обработка нового расписания
+            schedule_str = args[1].strip()
+            logger.debug(f"Попытка установить расписание: '{schedule_str}'")
+            
+            try:
+                # Валидация и преобразование
+                times = [t.strip() for t in schedule_str.split(",") if t.strip()]
+                
+                # Промежуточная проверка
+                if not times:
+                    raise ValueError("Не указано ни одного времени")
+                    
+                # Обновление через контроллер
+                await self.controller.update_publication_settings(
+                    mode='schedule',
+                    schedule=times
+                )
+                
+                # Формирование подтверждения
+                new_schedule = ", ".join([t.strftime("%H:%M") for t in self.controller.publication_schedule])
+                await message.answer(
+                    f"✅ Расписание обновлено!\nНовое расписание: {new_schedule}",
+                    parse_mode="HTML"
+                )
+                
+                # Дополнительный лог
+                logger.info(f"Расписание успешно изменено: {new_schedule}")
+                
+            except Exception as e:
+                error_msg = f"❌ Ошибка: {str(e)}\n\nПравильный формат: ЧЧ:ММ,ЧЧ:ММ,...\nПример: 9:30,12:00,18:45"
+                logger.error(f"Ошибка установки расписания: {str(e)}\nInput: '{schedule_str}'")
+                await message.answer(error_msg)
+                
+        except Exception as e:
+            logger.critical(f"Критическая ошибка в handle_set_schedule: {str(e)}", exc_info=True)
+            await message.answer("⚠️ Произошла системная ошибка. Пожалуйста, проверьте логи.")
+
+    async def show_publication_settings_menu(self, callback: CallbackQuery) -> None:
+        """Показывает меню настроек публикации с кнопкой для расписания"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        pub_mode = self.controller.publication_mode
+        pub_mode_text = "Расписание" if pub_mode == 'schedule' else "Задержка"
+        
+        text = (
+            "⚙️ <b>Настройки публикации</b>\n\n"
+            f"• <b>Режим:</b> {pub_mode_text}\n"
+        )
+        
+        if pub_mode == 'schedule':
+            schedule = ", ".join([t.strftime("%H:%M") for t in self.controller.publication_schedule])
+            text += f"• <b>Расписание:</b> {schedule}\n"
+        else:
+            text += f"• <b>Задержка:</b> {self.controller.min_delay} сек\n"
+        
+        # Создаем клавиатуру
+        builder = InlineKeyboardBuilder()
+        
+        # Основные кнопки
+        builder.button(text="📅 Управление расписанием", callback_data="manage_schedule")
+        builder.button(text="🔄 Сменить режим публикации", callback_data="switch_publication_mode")
+        builder.button(text="◀️ Назад в настройки", callback_data="settings")
+        
+        # Распределение кнопок по строкам
+        builder.adjust(1)
+        
+        try:
+            await callback.message.edit_text(
+                text=text,
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка показа меню публикации: {str(e)}")
+            await callback.answer("Ошибка обновления меню")
+        
+    async def handle_show_schedule(self, callback: CallbackQuery) -> None:
+        """Показывает текущее расписание"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        schedule = self.controller.publication_schedule
+        schedule_str = ", ".join([t.strftime("%H:%M") for t in schedule])
+        
+        text = (
+            "⏰ <b>Текущее расписание публикаций:</b>\n"
+            f"<code>{schedule_str}</code>\n\n"
+            "Для изменения используйте кнопку ниже или команду:\n"
+            "<code>/set_schedule 9:30,12:00,18:45</code>"
+        )
+        
+        # Клавиатура с кнопкой изменения
+        builder = InlineKeyboardBuilder()
+        builder.button(text="✏️ Изменить расписание", callback_data="edit_schedule")
+        builder.button(text="◀️ Назад", callback_data="manage_schedule")
+        builder.adjust(1)
+        
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+    async def handle_edit_schedule(self, callback: CallbackQuery) -> None:
+        """Запрашивает ввод нового расписания через UI"""
+        user_id = callback.from_user.id
+        self.pending_input[user_id] = {
+            'param': 'publication_schedule',
+            'type': 'publication',
+            'chat_id': callback.message.chat.id,
+        }
+        self.pending_input_timeouts[user_id] = time.time() + 300
+        
+        current_schedule = ", ".join(
+            [t.strftime("%H:%M") for t in self.controller.publication_schedule]
+        ) if self.controller else ""
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit_publication")
+        ]])
+        
+        text = (
+            "✏️ <b>Введите новое расписание публикаций</b>\n\n"
+            f"Текущее расписание: <code>{current_schedule}</code>\n\n"
+            "• Формат: <b>ЧЧ:ММ,ЧЧ:ММ,...</b>\n"
+            "• Пример: <code>9:30,12:00,18:45</code>\n"
+            "• Минимум 1 время, максимум 24"
+        )
+        
+        await callback.message.answer(
+            text=text,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+        await callback.answer()
+
+    async def handle_switch_publication_mode(self, callback: CallbackQuery) -> None:
+        """Предлагает выбор режима публикации"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        # Создаем клавиатуру
+        builder = InlineKeyboardBuilder()
+        
+        builder.button(text="⏱ Режим задержки", callback_data="set_mode_delay")
+        builder.button(text="⏰ Режим расписания", callback_data="set_mode_schedule")
+        builder.button(text="◀️ Назад", callback_data="publication_settings")
+        
+        builder.adjust(1)
+        
+        text = (
+            "🔄 <b>Смена режима публикации</b>\n\n"
+            f"Текущий режим: <b>{'Расписание' if self.controller.publication_mode == 'schedule' else 'Задержка'}</b>\n\n"
+            "Выберите новый режим:"
+        )
+        
+        await callback.message.edit_text(
+            text=text,
+            reply_markup=builder.as_markup(),
+            parse_mode="HTML"
+        )
+
+    async def handle_set_publication_mode(self, callback: CallbackQuery) -> None:
+        """Устанавливает новый режим публикации"""
+        mode = callback.data.replace("set_mode_", "")
+        
+        try:
+            if mode == "schedule":
+                # При переходе в режим расписания используем текущее расписание
+                schedule = [t.strftime("%H:%M") for t in self.controller.publication_schedule]
+                await self.controller.update_publication_settings(mode, schedule=schedule)
+            else:
+                # При переходе в режим задержки используем текущую задержку
+                delay = self.controller.min_delay
+                await self.controller.update_publication_settings(mode, delay=delay)
+            
+            await callback.answer(f"✅ Режим изменен на {mode}")
+            await self.show_publication_settings_menu(callback)
+        except Exception as e:
+            logger.error(f"Ошибка смены режима: {str(e)}")
+            await callback.answer(f"❌ Ошибка: {str(e)}")
+
+    async def handle_manage_schedule(self, callback: CallbackQuery) -> None:
+        """Обработчик кнопки управления расписанием"""
+        if not self.controller:
+            await callback.answer("Контроллер не подключен")
+            return
+        
+        # Создаем клавиатуру
+        builder = InlineKeyboardBuilder()
+        
+        # Кнопки действий
+        builder.button(text="✏️ Изменить расписание", callback_data="edit_schedule")
+        builder.button(text="👁 Показать текущее расписание", callback_data="show_schedule")
+        builder.button(text="◀️ Назад", callback_data="publication_settings")
+        
+        # Распределение кнопок
+        builder.adjust(1)
+        
+        try:
+            await callback.message.edit_text(
+                "📅 <b>Управление расписанием публикаций</b>\n\nВыберите действие:",
+                reply_markup=builder.as_markup(),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка показа меню расписания: {str(e)}")
+            await callback.answer("Ошибка обновления меню")
+
+    async def show_help_menu(self, message: Message):
+        """Показывает справку по формату команды"""
+        help_text = (
+            "❌ Неверный формат команды\n\n"
+            "📝 Используйте:\n"
+            "• Для установки расписания: `/set_schedule 9:30 12:00 18:45`\n"
+            "• Для показа меню настроек: просто `/set_schedule`"
+        )
+        await message.reply(help_text)
+
+    async def handle_set_mode(self, message: Message):
+        """Обработчик команды /set_mode"""
+        if not self.controller:
+            await message.reply("❌ Контроллер не инициализирован")
+            return
+            
+        try:
+            mode = message.text.split()[1].lower()
+            if mode not in ['schedule', 'delay']:
+                raise ValueError("Недопустимый режим")
+                
+            self.controller.set_publication_mode(mode)
+            await message.reply(f"✅ Режим изменен на '{mode}'")
+        except Exception as e:
+            logger.error(f"Ошибка смены режима: {str(e)}")
+            await message.reply("❌ Используйте: /set_mode schedule или /set_mode delay")
+    
+    def set_controller(self, controller):
+        """Устанавливает контроллер для обработки команд"""
+        self.controller = controller
+        logger.info("Контроллер установлен для Telegram бота")
 
     async def handle_clear_history(self, message: Message) -> None:
         if not await self.is_owner(message):
