@@ -147,7 +147,7 @@ async def test_bot_commands(telegram_bot: AsyncTelegramBot, owner_id: int):
     try:
         await telegram_bot.bot.send_message(  # Используем telegram_bot вместо bot
             chat_id=owner_id,
-            text="🤖 Бот успешно запущен и готов к работе!",
+            text="🤖 Бот успешно запущен!",
             parse_mode="HTML"
         )
         return True
