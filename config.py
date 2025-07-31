@@ -466,19 +466,23 @@ class Config:
             'MAX_CONCURRENT_IMAGE_TASKS': self.MAX_CONCURRENT_IMAGE_TASKS
         }
 
-    def _parse_schedule(self, schedule_str):
+    #Из-за того что в случае чота не работает видимо посты будут в 9 12 и 18 часов а нужно чтобы заставляли выбрать время, инаеч не прикольно
+    def _parse_schedule(self, schedule_str: str) -> List[time_class]:
         """Парсит строку расписания в список объектов time"""
         times = []
         for item in schedule_str.split(','):
+            item = item.strip()
+            if not item:
+                continue
+                
+            # Нормализация формата
+            if re.match(r"^\d{1}:\d{2}$", item):
+                item = f"0{item}"  # "9:30" -> "09:30"
+            
             try:
-                item = item.strip()
                 if ':' in item:
                     hour, minute = map(int, item.split(':'))
-                else:
-                    hour, minute = int(item), 0
-                
-                if 0 <= hour <= 23 and 0 <= minute <= 59:
-                    times.append(time_class(hour=hour, minute=minute))  # Используем алиас
+                    times.append(time_class(hour=hour, minute=minute))
             except ValueError:
                 continue
         
