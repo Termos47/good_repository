@@ -19,4 +19,4 @@ matplotlib==3.8.0
 numpy==1.26.0
 requests==2.31.0
 python-telegram-bot==20.3
-pytz==2025.7
+pytz==2025.2
