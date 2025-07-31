@@ -325,21 +325,36 @@ class BotController:
         """Вычисляет следующее время публикации на основе расписания"""
         now = datetime.now()
         current_time = now.time()
+        next_times = []
         
-        # Находим ближайшее будущее время в расписании
-        next_time = None
+        logger.debug(f"Текущее время: {current_time.strftime('%H:%M:%S')}")
+        logger.debug(f"Расписание: {[t.strftime('%H:%M') for t in self.publication_schedule]}")
+        
+        # Собираем все будущие времени на сегодня
         for t in self.publication_schedule:
             if t > current_time:
-                next_time = t
-                break
+                candidate = datetime.combine(now.date(), t)
+                next_times.append(candidate)
+                logger.debug(f"Будущее время: {candidate.strftime('%Y-%m-%d %H:%M')}")
         
-        if next_time:
-            self.next_scheduled_time = datetime.combine(now.date(), next_time)
-        else:
+        # Если на сегодня есть будущие времени
+        if next_times:
+            self.next_scheduled_time = min(next_times)
+            logger.info(f"Следующая публикация сегодня в: {self.next_scheduled_time.strftime('%H:%M')}")
+        elif self.publication_schedule:
+            # Если на сегодня ничего не осталось - берём первое на завтра
             tomorrow = now + timedelta(days=1)
-            self.next_scheduled_time = datetime.combine(tomorrow.date(), self.publication_schedule[0])
+            next_time = self.publication_schedule[0]
+            self.next_scheduled_time = datetime.combine(tomorrow.date(), next_time)
+            logger.info(f"Следующая публикация завтра в: {self.next_scheduled_time.strftime('%Y-%m-%d %H:%M')}")
+        else:
+            # Резервный вариант (должно быть невозможно)
+            self.next_scheduled_time = now + timedelta(minutes=5)
+            logger.warning("Расписание пусто! Установлено время публикации через 5 минут")
         
-        logger.info(f"Следующая публикация в: {self.next_scheduled_time.strftime('%H:%M')}")
+        # Детальное логирование
+        wait_seconds = (self.next_scheduled_time - now).total_seconds()
+        logger.info(f"Ожидание публикации: {wait_seconds/60:.1f} минут")
 
     async def _wait_for_publication_time(self):
         """Ожидает подходящего времени для публикации"""
@@ -385,6 +400,10 @@ class BotController:
             cycle_start = time.time()
             try:
                 self.stats['last_check'] = datetime.now()
+                
+                # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: пересчет времени перед каждой итерацией
+                if self.publication_mode == 'schedule':
+                    self._calculate_next_scheduled_time()
                 
                 # Получение и обработка новых постов
                 new_posts = await self._fetch_all_feeds()
@@ -557,7 +576,7 @@ class BotController:
             'schedule': [t.strftime('%H:%M') for t in self.publication_schedule]
         }
     
-    async def update_publication_settings(self, mode: str, schedule: list = None, delay: int = None):
+    async def update_publication_settings(self, mode: str, schedule: list = None, delay: int = None) -> bool:
         """Обновляет настройки публикации с исправлениями"""
         if mode not in ['schedule', 'delay']:
             raise ValueError("Недопустимый режим публикации")
@@ -573,9 +592,20 @@ class BotController:
                 if all(isinstance(t, time_class) for t in schedule):
                     time_objects = schedule
                 else:
-                    time_objects = [datetime.strptime(t.strip(), '%H:%M').time() for t in schedule if t.strip()]
+                    time_objects = []
+                    for t in schedule:
+                        try:
+                            # Нормализация формата: добавление ведущего нуля если нужно
+                            if re.match(r"^\d{1}:\d{2}$", t):
+                                t = f"0{t}"  # Преобразуем "9:30" в "09:30"
+                            time_obj = datetime.strptime(t.strip(), '%H:%M').time()
+                            time_objects.append(time_obj)
+                        except ValueError:
+                            logger.warning(f"Пропущено невалидное время: {t}")
+                            continue
                 
                 self.publication_schedule = sorted(time_objects)
+                # Обязательный пересчет времени после изменения расписания
                 self._calculate_next_scheduled_time()
             else:
                 if delay is None:
@@ -595,14 +625,12 @@ class BotController:
             self.config.save_to_env_file("PUBLICATION_MODE", mode)
             self.config.save_to_env_file("MIN_DELAY_BETWEEN_POSTS", str(self.min_delay))
             
-            logger.info(f"Настройки публикации обновлены: mode={mode}, delay={self.min_delay}, schedule={getattr(self, 'publication_schedule', [])}")
+            logger.info(f"Настройки публикации обновлены: mode={mode}, delay={self.min_delay}, schedule={[t.strftime('%H:%M') for t in self.publication_schedule]}")
             return True
             
         except Exception as e:
             logger.error(f"Ошибка обновления настроек публикации: {str(e)}", exc_info=True)
             raise
-        
-        logger.info(f"Настройки публикации обновлены: mode={mode}, delay={self.min_delay}, schedule={self.publication_schedule}")
 
     def set_publication_mode(self, mode: str, **params) -> None:
         """Установка режима публикации с сохранением в .env"""
