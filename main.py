@@ -14,7 +14,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update, Message, ErrorEvent
 from aiogram.exceptions import TelegramAPIError
 from config import Config
-from datetime import datetime
 from bot_controller import BotController
 from pathlib import Path
 from state_manager import StateManager

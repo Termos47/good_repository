@@ -5,11 +5,9 @@ import os
 import logging
 import re
 import time
-from datetime import time as time_class
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from state_manager import StateManager
 from typing import Optional, List, Dict, Any, Union
-from datetime import datetime
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, BotCommand, InputFile, FSInputFile, MenuButtonCommands, CallbackQuery, InputMediaPhoto, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder

@@ -15,7 +15,6 @@ import logging
 import matplotlib.pyplot as plt
 import numpy as np
 from io import BytesIO
-from datetime import datetime
 import time
 
 logger = logging.getLogger('VisualInterface')

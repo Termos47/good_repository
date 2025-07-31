@@ -2,10 +2,10 @@ import json
 import os
 import logging
 import logging.config
-from datetime import datetime
 import re
+import pytz
 import shutil
-from datetime import time as time_class
+from datetime import datetime, time as time_class
 import time
 import traceback
 from typing import Dict, Any, List, Optional, Tuple, Union
@@ -38,7 +38,7 @@ class StructuredFormatter(logging.Formatter):
         'RESET': '\033[0m'       # Reset color
     }
     
-    def __init__(self, debug_mode: bool = False, use_colors: bool = True):
+    def __init__(self, debug_mode: bool = False, use_colors: bool = True, timezone: str = 'Europe/Moscow'):
         """
         Инициализация форматтера
         
@@ -49,6 +49,7 @@ class StructuredFormatter(logging.Formatter):
         self.debug_mode = debug_mode
         self.use_colors = use_colors
         self._init_colors()
+        self.timezone = pytz.timezone(timezone)
 
     def add_to_env(self, param: str, value: str):
         """Добавляет параметр в .env при первом запуске"""
@@ -101,8 +102,7 @@ class StructuredFormatter(logging.Formatter):
         """Форматирует запись лога в строку"""
         try:
             # Форматируем timestamp с миллисекундами
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-            
+            timestamp = datetime.now(self.timezone).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             # Определяем стиль форматирования
             if self.debug_mode:
                 style = 'debug'
@@ -185,6 +185,7 @@ class ContextLoggerAdapter(logging.LoggerAdapter):
 def setup_logging(
     debug_mode: bool = False,
     log_file: Optional[str] = None,
+    timezone: str = 'Europe/Moscow',
     max_bytes: int = 10 * 1024 * 1024,  # 10 MB
     backup_count: int = 5,
     use_colors: bool = True
@@ -231,7 +232,8 @@ def setup_logging(
             'colored': {
                 '()': 'config.StructuredFormatter',
                 'debug_mode': debug_mode,
-                'use_colors': use_colors
+                'use_colors': use_colors,
+                'timezone': timezone
             },
             'detailed': {
                 'format': (
@@ -300,7 +302,8 @@ class Config:
         
         # Настройка базовых параметров
         self.DEBUG_MODE: bool = self.get_env_var('DEBUG_MODE', default=False, var_type=bool)
-        setup_logging(self.DEBUG_MODE)
+        self.TIMEZONE = self.get_env_var('TIMEZONE', default='Europe/Moscow')
+        setup_logging(debug_mode=self.DEBUG_MODE, timezone=self.TIMEZONE)
         self.NOTIFY_LEVEL = self.get_env_var('NOTIFY_LEVEL', default='ERROR')
         self.NOTIFY_TYPES = self.get_list('NOTIFY_TYPES', ['errors', 'warnings'])
         
