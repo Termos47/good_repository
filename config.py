@@ -370,7 +370,9 @@ class Config:
         )
         self.YAGPT_ERROR_THRESHOLD: int = self.get_env_var('YAGPT_ERROR_THRESHOLD', default=5, var_type=int)
         self.AUTO_ENABLE_YAGPT: bool = self.get_env_var('AUTO_ENABLE_YAGPT', default=True, var_type=bool)
-        
+        # В config.py
+        self.MAX_CONCURRENT_GPT_REQUESTS = int(os.getenv('MAX_CONCURRENT_GPT_REQUESTS', 3))
+
         # Параметры контента
         self.MIN_TITLE_LENGTH: int = self.get_env_var('MIN_TITLE_LENGTH', default=0, var_type=int)
         self.MAX_TITLE_LENGTH: int = self.get_env_var('MAX_TITLE_LENGTH', default=1500, var_type=int)
@@ -468,25 +470,50 @@ class Config:
 
     #Из-за того что в случае чота не работает видимо посты будут в 9 12 и 18 часов а нужно чтобы заставляли выбрать время, инаеч не прикольно
     def _parse_schedule(self, schedule_str: str) -> List[time_class]:
-        """Парсит строку расписания в список объектов time"""
+        """Парсит строку расписания в список объектов time с поддержкой секунд"""
         times = []
+        
+        # Защита от пустых значений
+        if not schedule_str or not isinstance(schedule_str, str):
+            return self._get_default_schedule()
+        
         for item in schedule_str.split(','):
             item = item.strip()
             if not item:
                 continue
                 
-            # Нормализация формата
-            if re.match(r"^\d{1}:\d{2}$", item):
-                item = f"0{item}"  # "9:30" -> "09:30"
-            
             try:
-                if ':' in item:
-                    hour, minute = map(int, item.split(':'))
-                    times.append(time_class(hour=hour, minute=minute))
-            except ValueError:
+                # Поддерживаем форматы: "9:30", "09:30:45", "22:00"
+                time_parts = item.split(':')
+                
+                # Обрабатываем часы
+                hour = int(time_parts[0])
+                if hour < 0 or hour > 23:
+                    continue
+                    
+                # Обрабатываем минуты
+                minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+                if minute < 0 or minute > 59:
+                    continue
+                    
+                # Обрабатываем секунды
+                second = int(time_parts[2]) if len(time_parts) > 2 else 0
+                if second < 0 or second > 59:
+                    continue
+                    
+                times.append(time_class(hour=hour, minute=minute, second=second))
+            except (ValueError, IndexError):
                 continue
         
-        return sorted(times) if times else [
+        # Сортируем и удаляем дубликаты
+        unique_times = list(set(times))
+        unique_times.sort()
+        
+        return unique_times if unique_times else self._get_default_schedule()
+
+    def _get_default_schedule(self):
+        """Возвращает расписание по умолчанию"""
+        return [
             time_class(9, 0), 
             time_class(12, 0), 
             time_class(18, 0)

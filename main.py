@@ -218,12 +218,14 @@ async def run_bot():
             logger.error("Bot can't send messages, check TOKEN and OWNER_ID")
         
         # Инициализация компонентов
+        # Создаем временный экземпляр RSS-парсера без контроллера
         rss_parser = AsyncRSSParser(session, config.PROXY_URL)
+        
+        # Инициализация YandexGPT и генератора изображений
         yandex_gpt = AsyncYandexGPT(config, session)
         image_generator = AsyncImageGenerator(config)
         logger.info("All components initialized")
-        internet_check_task = asyncio.create_task(check_internet_connection(session))
-
+        
         # Создание контроллера
         controller = BotController(
             config=config,
@@ -234,6 +236,14 @@ async def run_bot():
             telegram_bot=telegram_bot
         )
         logger.info("Bot controller created")
+        
+        # Связываем контроллер с конфигом
+        config.controller = controller
+        logger.info("Controller successfully set in config")
+        
+        # Обновляем RSS-парсер с контроллером и callback
+        rss_parser.set_controller(controller)
+        rss_parser.set_on_session_recreate(controller._recreate_session)
         
         # Передаем контроллер в Telegram бота
         telegram_bot.set_controller(controller)

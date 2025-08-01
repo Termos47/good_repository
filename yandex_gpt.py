@@ -16,6 +16,7 @@ class AsyncYandexGPT:
         # Проверяем состояние сессии при инициализации
         session_ok = not session.closed if session else False
         self.active = bool(config.YANDEX_API_KEY) and config.ENABLE_YAGPT and session_ok
+        self.last_error = None
         
         # Инициализация статистики
         self.stats = {

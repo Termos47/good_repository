@@ -216,6 +216,26 @@ class AsyncTelegramBot:
             logger.error(f"Ошибка отправки поста '{title[:30]}...': {str(e)}")
             return False
     
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        parse_mode: Optional[str] = "HTML",
+        **kwargs
+    ) -> bool:
+        """Отправляет текстовое сообщение в указанный чат"""
+        try:
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                **kwargs
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения: {str(e)}")
+            return False
+        
     def _register_handlers(self) -> None:
         self.dp.message.register(self.handle_start, Command("start", "help", "menu"))
         self.dp.message.register(self.handle_status, Command("status"))
@@ -1637,70 +1657,75 @@ class AsyncTelegramBot:
             await message.answer(f"❌ Ошибка: {str(e)}")
 
     async def handle_set_schedule(self, message: Message) -> None:
-        """Обработчик команды /set_schedule с полной диагностикой"""
+        """Обработчик команды /set_schedule"""
+        # Проверка прав доступа
+        if not await self.enforce_owner_access(message):
+            return
+            
+        # Проверка наличия контроллера
+        if not self.controller:
+            await message.answer("❌ Контроллер не инициализирован")
+            return
+            
+        args = message.text.split(maxsplit=1)
+        schedule_str = args[1].strip() if len(args) > 1 else None
+
         try:
-            # 1. Проверка прав доступа
-            if not await self.enforce_owner_access(message):
-                return
-            
-            # 2. Проверка наличия контроллера
-            if not self.controller:
-                logger.error("Контроллер не установлен при обработке /set_schedule")
-                await message.answer("❌ Системная ошибка: контроллер не подключен")
-                return
-            
-            # 3. Разбор команды
-            args = message.text.split(maxsplit=1)
-            command_debug = f"Команда: {message.text}\nПользователь: {message.from_user.id}"
-            logger.info(f"Обработка /set_schedule: {command_debug}")
-            
-            # 4. Режим показа текущего расписания
-            if len(args) < 2:
-                current_schedule = ", ".join([t.strftime("%H:%M") for t in self.controller.publication_schedule])
-                await message.answer(
-                    f"⏰ Текущее расписание: {current_schedule}\n\n"
-                    "Для изменения отправьте:\n"
-                    "<code>/set_schedule 9:30,12:00,18:45</code>",
-                    parse_mode="HTML"
-                )
-                return
-            
-            # 5. Обработка нового расписания
-            schedule_str = args[1].strip()
-            logger.debug(f"Попытка установить расписание: '{schedule_str}'")
-            
-            try:
-                # Валидация и преобразование
-                times = [t.strip() for t in schedule_str.split(",") if t.strip()]
+            # Если аргументы не предоставлены, показываем текущие настройки
+            if not schedule_str:
+                current_settings = self.controller.get_publication_settings()
+                schedule_times = current_settings['schedule']
+                schedule_text = ', '.join(schedule_times)
+                next_time = self.controller.next_scheduled_time.strftime('%H:%M') if self.controller.next_scheduled_time else "не рассчитано"
                 
-                # Промежуточная проверка
-                if not times:
-                    raise ValueError("Не указано ни одного времени")
+                response = (
+                    "📅 Текущее расписание публикаций:\n"
+                    f"Режим: {current_settings['mode']}\n"
+                    f"Задержка: {current_settings['delay']} сек\n"
+                    f"Времена: {schedule_text}\n"
+                    f"Следующая публикация: {next_time}\n\n"
+                    "Чтобы изменить расписание, используйте:\n"
+                    "/set_schedule 9:30,12:00,18:45"
+                )
+                await message.answer(response)
+                return
+
+            # Проверяем и нормализуем формат времени
+            schedule_list = [t.strip() for t in schedule_str.split(',')]
+            validated_times = []
+            
+            for t in schedule_list:
+                # Проверка формата времени
+                if not re.match(r"^\d{1,2}:\d{2}$", t):
+                    raise ValueError(f"❌ Неверный формат времени: '{t}'. Используйте ЧЧ:ММ")
+                
+                # Нормализация формата (добавляем ведущий ноль при необходимости)
+                if re.match(r"^\d{1}:\d{2}$", t):
+                    t = f"0{t}"  # "9:30" -> "09:30"
                     
-                # Обновление через контроллер
-                await self.controller.update_publication_settings(
-                    mode='schedule',
-                    schedule=times
-                )
-                
-                # Формирование подтверждения
-                new_schedule = ", ".join([t.strftime("%H:%M") for t in self.controller.publication_schedule])
-                await message.answer(
-                    f"✅ Расписание обновлено!\nНовое расписание: {new_schedule}",
-                    parse_mode="HTML"
-                )
-                
-                # Дополнительный лог
-                logger.info(f"Расписание успешно изменено: {new_schedule}")
-                
-            except Exception as e:
-                error_msg = f"❌ Ошибка: {str(e)}\n\nПравильный формат: ЧЧ:ММ,ЧЧ:ММ,...\nПример: 9:30,12:00,18:45"
-                logger.error(f"Ошибка установки расписания: {str(e)}\nInput: '{schedule_str}'")
-                await message.answer(error_msg)
-                
+                # Проверка валидности времени
+                hour, minute = map(int, t.split(':'))
+                if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                    raise ValueError(f"❌ Недопустимое время: {t}")
+                    
+                validated_times.append(t)
+            
+            # Обновление настроек в контроллере
+            await self.controller.update_publication_settings(
+                mode='schedule',
+                schedule=validated_times
+            )
+            
+            # Формируем список времен для ответа
+            schedule_text = ', '.join(validated_times)
+            next_time = self.controller.next_scheduled_time.strftime('%H:%M')
+            await message.answer(f"✅ Расписание успешно обновлено: {schedule_text}")
+            await message.answer(f"⏱ Следующая публикация в: {next_time}")
+            
         except Exception as e:
-            logger.critical(f"Критическая ошибка в handle_set_schedule: {str(e)}", exc_info=True)
-            await message.answer("⚠️ Произошла системная ошибка. Пожалуйста, проверьте логи.")
+            error_msg = str(e)
+            logger.error(f"Ошибка установки расписания: {error_msg}")
+            await message.answer(error_msg)
 
     async def show_publication_settings_menu(self, callback: CallbackQuery) -> None:
         """Показывает меню настроек публикации с кнопкой для расписания"""

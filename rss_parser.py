@@ -40,6 +40,7 @@ class AsyncRSSParser:
     ):
         self.session = session
         self.proxy_url = proxy_url
+        self.controller = None  # Добавьте эту строку
         self.on_session_recreate = on_session_recreate  # Инициализация атрибута
         self.timeout = aiohttp.ClientTimeout(total=30, sock_read=25)
         self.semaphore = asyncio.Semaphore(5)
@@ -60,11 +61,21 @@ class AsyncRSSParser:
             del self.feed_errors[url]
             logger.info(f"RSS status reset for {url}")
 
+    def set_controller(self, controller):
+        """Устанавливает контроллер для отправки уведомлений"""
+        self.controller = controller
+        
+    def set_on_session_recreate(self, callback: Callable):
+        """Устанавливает callback для пересоздания сессии"""
+        self.on_session_recreate = callback
+
     async def fetch_feed(self, url: str) -> Optional[Dict[str, Any]]:
         """Асинхронно загружает и парсит RSS-ленту с повторными попытками"""
+        # Добавлена проверка активности ленты в начале метода
         if not self.feed_status.get(url, True):
+            logger.debug(f"Лента отключена: {url}")
             return None
-        
+            
         # Проверяем состояние сессии перед выполнением запроса
         if self.session.closed:
             logger.critical("Session is closed! Attempting to recreate...")
@@ -91,12 +102,32 @@ class AsyncRSSParser:
                 ) as response:
                     if response.status != 200:
                         logger.error(f"HTTP error {response.status} for {url}")
+                        
+                        # Отправляем уведомление об ошибке
+                        error_msg = (
+                            f"⚠️ <b>Ошибка загрузки RSS</b>\n"
+                            f"└ URL: {url}\n"
+                            f"└ Код: {response.status}"
+                        )
+                        if self.controller:
+                            asyncio.create_task(self.controller._send_status_notification(error_msg))
+                        
                         return None
 
                     content = await response.read()
                     logger.debug(f"Raw content received for {url}, length: {len(content)} bytes")
+                    
+                    # Отправляем уведомление об успешной загрузке
+                    success_msg = (
+                        f"📥 <b>RSS загружен</b>\n"
+                        f"└ URL: {url}\n"
+                        f"└ Размер: {len(content)//1024} KB"
+                    )
+                    if self.controller:
+                        asyncio.create_task(self.controller._send_status_notification(success_msg))
+                        
                     return await self._safe_parse_feed(content)
-
+                    
             except aiohttp.ClientOSError as e:
                 if "APPLICATION_DATA_AFTER_CLOSE_NOTIFY" in str(e) and attempt < self.max_retries:
                     logger.warning(f"SSL error detected, retrying ({attempt}/{self.max_retries}) for {url}")
@@ -104,6 +135,16 @@ class AsyncRSSParser:
                 else:
                     self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
                     logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
+                    
+                    # Отправляем уведомление об ошибке сети
+                    error_msg = (
+                        f"⚠️ <b>Сетевая ошибка</b>\n"
+                        f"└ URL: {url}\n"
+                        f"└ Ошибка: {str(e)[:100]}"
+                    )
+                    if self.controller:
+                        asyncio.create_task(self.controller._send_status_notification(error_msg))
+                        
                     return None
                     
             except RuntimeError as e:
@@ -113,11 +154,31 @@ class AsyncRSSParser:
                 else:
                     self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
                     logger.error(f"RuntimeError fetching {url}: {str(e)}", exc_info=True)
+                    
+                    # Отправляем уведомление об ошибке
+                    error_msg = (
+                        f"⚠️ <b>Ошибка выполнения</b>\n"
+                        f"└ URL: {url}\n"
+                        f"└ Ошибка: {str(e)[:100]}"
+                    )
+                    if self.controller:
+                        asyncio.create_task(self.controller._send_status_notification(error_msg))
+                        
                     return None
                     
             except Exception as e:
                 self.feed_errors[url] = self.feed_errors.get(url, 0) + 1
                 logger.error(f"Error fetching {url}: {str(e)}", exc_info=True)
+                
+                # Отправляем уведомление об общей ошибке
+                error_msg = (
+                    f"⚠️ <b>Неизвестная ошибка</b>\n"
+                    f"└ URL: {url}\n"
+                    f"└ Ошибка: {str(e)[:100]}"
+                )
+                if self.controller:
+                    asyncio.create_task(self.controller._send_status_notification(error_msg))
+                    
                 return None
         
         return None

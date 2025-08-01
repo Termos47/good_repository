@@ -27,15 +27,12 @@ logger = logging.getLogger('bot.controller')
 class BotController:
     def __init__(self, config, state_manager, rss_parser, image_generator, yandex_gpt, telegram_bot):
         self.config = config
-        self.state_manager = StateManager(
-            state_file=config.STATE_FILE,
-            config=config
-        )
+        self.state_manager = state_manager
         self.rss_parser = rss_parser
         self.image_generator = image_generator
         self.yandex_gpt = yandex_gpt
         self.telegram_bot = telegram_bot
-        self.REQUIRE_IMAGE = True  # True - требовать изображение, False - разрешать посты без изображений
+        self.REQUIRE_IMAGE = True
         self._validate_config()
         self.hourly_stats = {f"hour_{h}": 0 for h in range(24)}
 
@@ -43,16 +40,14 @@ class BotController:
         self.min_delay = config.MIN_DELAY_BETWEEN_POSTS
         self.publication_schedule = config.PUBLICATION_SCHEDULE
         self.next_scheduled_time = None
+        self.schedule_changed = asyncio.Event()
         
         if self.publication_mode == 'schedule':
             self._calculate_next_scheduled_time()
         
         logger.info(f"Настройки публикации: mode={self.publication_mode}, delay={self.min_delay}s, schedule={self.publication_schedule}")
         
-        # Инициализация логгера
         self.logger = logging.getLogger('bot.controller')
-        
-        # Инициализация асинхронных ресурсов
         self.session = None
         self.image_semaphore = None
         self.is_running = False
@@ -62,12 +57,10 @@ class BotController:
         self.task_monitor_task = None
         self.last_post_time = 0.0
         
-        # Инициализация ProcessPoolExecutor для генерации изображений
         self.image_executor = concurrent.futures.ProcessPoolExecutor(
             max_workers=config.IMAGE_GENERATION_WORKERS
         )
         
-        # Статистика
         self.stats = {
             'start_time': datetime.now(),
             'posts_sent': 0,
@@ -92,15 +85,10 @@ class BotController:
         
         self.post_timestamps = []
         
-        # Загрузка состояния
         try:
-            # Проверяем существование файла состояния
             state_file_exists = os.path.exists(self.state_manager.state_file)
-            
-            # Загружаем состояние из менеджера
             self.state_manager.load_state()
             
-            # Если файл состояния не существует - создаем новый
             if not state_file_exists:
                 self.logger.warning(f"State file {self.state_manager.state_file} not found, creating new one")
                 try:
@@ -109,19 +97,19 @@ class BotController:
                 except Exception as e:
                     self.logger.error(f"Failed to create state file: {str(e)}")
             
-            # Обновляем статистику из загруженного состояния
             if 'stats' in self.state_manager.state:
                 self.stats.update(self.state_manager.state['stats'])
                 self.logger.debug("Stats loaded from state")
         except Exception as e:
             self.logger.error(f"Error initializing state: {str(e)}", exc_info=True)
-            
-            # Создаем резервное состояние при ошибке
             try:
                 self.state_manager.save_state()
                 self.logger.warning("Created backup state after initialization error")
             except Exception as backup_error:
                 self.logger.critical(f"Critical state error: {str(backup_error)}")
+        
+        # Добавлено: событие для отслеживания изменений в расписании
+        self.schedule_changed = asyncio.Event()
     
     def _validate_config(self):
         required = [
@@ -176,6 +164,11 @@ class BotController:
             logger.warning("Controller is already running")
             return False
             
+        # Добавлено: проверка на уже инициализированные задачи
+        if hasattr(self, '_tasks_initialized') and self._tasks_initialized:
+            logger.warning("Tasks already initialized")
+            return False
+            
         try:
             self.session = await self._create_session()
             self.image_semaphore = asyncio.Semaphore(self.config.MAX_CONCURRENT_IMAGE_TASKS)
@@ -190,11 +183,15 @@ class BotController:
             self.session_refresh_task = asyncio.create_task(self._session_refresh_loop())
             self.task_monitor_task = asyncio.create_task(self._task_monitor_loop())
             
+            # Установка парсера RSS с колбэком пересоздания сессии
             self.rss_parser = AsyncRSSParser(
-            session=self.session,
-            proxy_url=self.config.PROXY_URL,
-            on_session_recreate=self._recreate_session  # Передаем колбэк
+                session=self.session,
+                proxy_url=self.config.PROXY_URL,
+                on_session_recreate=self._recreate_session
             )
+            
+            # Помечаем задачи как инициализированные
+            self._tasks_initialized = True
             return True
         except Exception as e:
             logger.error("Failed to start controller: %s", str(e), exc_info=True)
@@ -322,53 +319,55 @@ class BotController:
         except Exception as e:
             logger.error(f"Task cleanup failed: {str(e)}")
 
+    def refresh_schedule(self) -> None:
+        """Пересчитывает время следующей публикации"""
+        if self.publication_mode == 'schedule':
+            tz = pytz.timezone(self.config.TIMEZONE)
+            self._calculate_next_scheduled_time()
+            logger.info(f"Следующая публикация: {self.next_scheduled_time.astimezone(tz).strftime('%Y-%m-%d %H:%M')}")
+
     def _calculate_next_scheduled_time(self):
         """Вычисляет следующее время публикации с учетом часового пояса"""
         tz = pytz.timezone(self.config.TIMEZONE)
         now = datetime.now(tz)
-        current_time = now.timetz()
+        current_time = now.time()  # Берем только время без даты
         
-        logger.debug(f"Текущее время: {current_time}")
-        logger.debug(f"Расписание: {[t.strftime('%H:%M') for t in self.publication_schedule]}")
+        # Защита от None
+        if not self.publication_schedule:
+            logger.warning("Publication schedule is empty! Using default.")
+            self.publication_schedule = self._get_default_schedule()
         
-        # Находим ближайшее будущее время
-        next_times = []
+        logger.debug(f"Текущее время: {current_time.strftime('%H:%M:%S')}")
+        logger.debug(f"Расписание: {[t.strftime('%H:%M:%S') for t in self.publication_schedule]}")
+
+        # Ищем ближайшее время ВКЛЮЧАЯ текущее
+        next_time_candidate = None
+        
         for t in self.publication_schedule:
-            candidate = tz.localize(datetime.combine(now.date(), t))
-            if candidate > now:
-                next_times.append(candidate)
-                logger.debug(f"Будущее время: {candidate.strftime('%Y-%m-%d %H:%M')}")
-        
-        if next_times:
-            self.next_scheduled_time = min(next_times)
-            logger.info(f"Следующая публикация: {self.next_scheduled_time.strftime('%Y-%m-%d %H:%M')}")
-        elif self.publication_schedule:
-            # Первое время на следующий день
+            # Сравниваем время без даты
+            if t > current_time or t == current_time:
+                candidate = datetime.combine(now.date(), t)
+                candidate = tz.localize(candidate)
+                
+                # Если нашли подходящее время сегодня
+                if next_time_candidate is None or candidate < next_time_candidate:
+                    next_time_candidate = candidate
+                    logger.debug(f"Найдено время сегодня: {candidate.strftime('%H:%M:%S')}")
+
+        # Если не нашли - берем первое время на следующий день
+        if next_time_candidate is None and self.publication_schedule:
             tomorrow = now + timedelta(days=1)
             next_time = self.publication_schedule[0]
-            self.next_scheduled_time = tz.localize(datetime.combine(tomorrow.date(), next_time))
-            logger.info(f"Следующая публикация: {self.next_scheduled_time.strftime('%Y-%m-%d %H:%M')} (завтра)")
-        else:
-            self.next_scheduled_time = now + timedelta(minutes=5)
-            logger.warning("Расписание пусто! Установлено время через 5 минут")
+            next_time_candidate = tz.localize(datetime.combine(tomorrow.date(), next_time))
+            logger.debug(f"Используем время завтра: {next_time_candidate.strftime('%H:%M:%S')}")
         
-        # Расчет времени ожидания
+        # Если все еще не определено (пустое расписание)
+        self.next_scheduled_time = next_time_candidate or now + timedelta(minutes=5)
+        
+        # Логируем итоговое время
         wait_seconds = (self.next_scheduled_time - now).total_seconds()
+        logger.info(f"Следующая публикация: {self.next_scheduled_time.strftime('%Y-%m-%d %H:%M:%S')}")
         logger.info(f"Ожидание публикации: {wait_seconds:.1f} сек ({wait_seconds/60:.1f} мин)")
-
-    async def _wait_for_publication_time(self):
-        """Ожидает подходящего времени для публикации"""
-        if self.publication_mode == 'schedule':
-            now = datetime.now()
-            if not self.next_scheduled_time or now >= self.next_scheduled_time:
-                self._calculate_next_scheduled_time()
-            
-            wait_seconds = (self.next_scheduled_time - now).total_seconds()
-            if wait_seconds > 0:
-                logger.info(f"Ждем {wait_seconds/60:.1f} мин до публикации")
-                await asyncio.sleep(wait_seconds)
-        else:
-            await self._enforce_post_delay()
 
     # Добавьте эти методы для управления настройками:
     def set_publication_mode(self, mode):
@@ -389,8 +388,12 @@ class BotController:
             self._calculate_next_scheduled_time()
 
     def set_publication_schedule(self, times: List[time_class]):
+        """Устанавливает новое расписание публикаций"""
         self.publication_schedule = sorted(times)
         self._calculate_next_scheduled_time()
+        # Сигнализируем об изменении расписания
+        self.schedule_changed.set()
+        logger.info(f"Расписание обновлено: {[t.strftime('%H:%M') for t in times]}")
 
     async def _rss_processing_loop(self):
         """Основной цикл обработки RSS-лент"""
@@ -400,10 +403,6 @@ class BotController:
             cycle_start = time.time()
             try:
                 self.stats['last_check'] = datetime.now()
-                
-                # КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: пересчет времени перед каждой итерацией
-                if self.publication_mode == 'schedule':
-                    self._calculate_next_scheduled_time()
                 
                 # Получение и обработка новых постов
                 new_posts = await self._fetch_all_feeds()
@@ -662,22 +661,58 @@ class BotController:
         )
         
     async def _wait_for_publication_time(self):
+        """Ожидает подходящего времени для публикации с точностью до секунд"""
         if self.publication_mode != 'schedule':
             return
             
-        now = datetime.now()
+        tz = pytz.timezone(self.config.TIMEZONE)
         
-        # Всегда пересчитываем следующее время перед ожиданием
-        self._calculate_next_scheduled_time()
-        
-        wait_seconds = (self.next_scheduled_time - now).total_seconds()
-        
-        if wait_seconds > 0:
-            logger.info(f"Ожидание публикации: {wait_seconds:.1f} сек")
-            await asyncio.sleep(wait_seconds)
-        elif wait_seconds < 0:
-            # Если время публикации уже прошло, пропускаем ожидание
-            logger.warning(f"Время публикации уже прошло: {-wait_seconds:.1f} сек назад")
+        while self.is_running:
+            try:
+                # Всегда актуальное расписание
+                self._calculate_next_scheduled_time()
+                now = datetime.now(tz)
+                
+                # Если время пришло - выходим
+                if now >= self.next_scheduled_time:
+                    logger.info("Время публикации наступило!")
+                    return
+                    
+                # Сколько осталось ждать
+                wait_seconds = (self.next_scheduled_time - now).total_seconds()
+                
+                # Разбиваем ожидание на короткие интервалы
+                while wait_seconds > 0 and self.is_running:
+                    # Ждем не более 1 секунды за раз для точности
+                    chunk = min(wait_seconds, 1.0)
+                    await asyncio.sleep(chunk)
+                    
+                    # Обновляем оставшееся время
+                    now = datetime.now(tz)
+                    new_wait = (self.next_scheduled_time - now).total_seconds()
+                    
+                    # Если время изменилось (корректировка или новый слот)
+                    if abs(new_wait - wait_seconds) > 2.0:
+                        logger.debug(f"Обнаружена корректировка времени: {new_wait:.1f} сек")
+                        break
+                        
+                    wait_seconds = new_wait
+                    
+                    # Проверяем флаг изменения расписания
+                    if self.schedule_changed.is_set():
+                        logger.info("Расписание изменилось, прерываю ожидание")
+                        self.schedule_changed.clear()
+                        break
+                        
+                # Если время вышло в процессе коротких ожиданий
+                if wait_seconds <= 0:
+                    return
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Ошибка ожидания публикации: {str(e)}")
+                await asyncio.sleep(1)
         
     async def _process_new_posts(self, posts: List[Dict]):
         """Обработка новых постов с улучшенным логированием"""
@@ -781,25 +816,31 @@ class BotController:
     async def _process_single_post(self, post: Union[Dict, str]) -> bool:
         image_path = None
         try:
-            # 1. Нормализация поста
+            # 1. ОЖИДАНИЕ ВРЕМЕНИ ПУБЛИКАЦИИ В НАЧАЛЕ ОБРАБОТКИ
+            if self.publication_mode == 'schedule':
+                await self._wait_for_publication_time()
+            else:
+                await self._enforce_post_delay()
+
+            # 2. Нормализация поста
             normalized_post = self._normalize_post(post)
             if not normalized_post:
                 logger.debug("Пост не может быть нормализован")
                 return False
 
-            # 2. Генерация ID
+            # 3. Генерация ID
             post_id = self._generate_post_id(normalized_post)
             normalized_post['post_id'] = post_id
             original_title = normalized_post.get('title', '')[:50]
             logger.debug(f"🆔 Обработка поста: {original_title}")
 
-            # 3. Обработка контента
+            # 4. Обработка контента
             processed_content = await self._process_post_content(normalized_post)
             if processed_content is None:
                 logger.debug("Контент поста не обработан")
                 return False
 
-            # 4. Получение изображения
+            # 5. Получение изображения
             if self.config.IMAGE_SOURCE != 'none':
                 # Пытаемся получить изображение из RSS
                 if normalized_post.get('image_url'):
@@ -819,16 +860,10 @@ class BotController:
                             normalized_post['post_id']
                         )
             
-            # 5. Критическая проверка: изображение обязательно!
+            # 6. Критическая проверка: изображение обязательно!
             if not image_path:
                 logger.info(f"🚫 Пропуск поста: изображение не найдено {original_title}")
                 return False
-
-            # 6. Ожидание времени публикации ПЕРЕД ОТПРАВКОЙ
-            if self.publication_mode == 'schedule':
-                await self._wait_for_publication_time()
-            else:
-                await self._enforce_post_delay()
 
             # 7. Отправка в Telegram
             processed_title = processed_content.get('title', '')[:50]
@@ -843,7 +878,7 @@ class BotController:
                 logger.info(f"✅ Пост отправлен: {processed_title}")
                 return True
             return False
-
+            
         except Exception as e:
             logger.error(f"⚠️ Ошибка обработки: {str(e)}", exc_info=True)
             return False
@@ -941,8 +976,8 @@ class BotController:
             description = post.get('description', '')
             
             # Устанавливаем гибкие пороги проверки
-            MIN_TITLE_LEN = 3  # вместо 5
-            MIN_DESC_LEN = 15  # вместо 20
+            MIN_TITLE_LEN = 5  # вместо 5
+            MIN_DESC_LEN = 0  # вместо 20
             
             if len(title) < MIN_TITLE_LEN or len(description) < MIN_DESC_LEN:
                 # Обновляем сообщение для точной диагностики
